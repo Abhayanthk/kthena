@@ -63,6 +63,11 @@ func NewJWTAuthenticator(routerConfig *conf.RouterConfiguration) *JWTAuthenticat
 		return &JWTAuthenticator{enabled: false}
 	}
 
+	if routerConfig.Auth.Issuer == "" && len(routerConfig.Auth.Audiences) == 0 {
+		klog.Warningf("auth.issuer and auth.audiences are both unset, every token signed by a key from %s will be accepted",
+			routerConfig.Auth.JwksUri)
+	}
+
 	// Create and configure the JWKS rotator
 	rotator := NewJWKSRotator(routerConfig.Auth)
 	if rotator != nil {
