@@ -903,6 +903,16 @@ func (s *store) AddOrUpdateModelServer(ms *aiv1alpha1.ModelServer, pods sets.Set
 		if pods != nil {
 			modelServerObj.pods = pods
 		}
+		// Pods handled before this ModelServer was added are already in s.pods
+		// but were never categorized. The lock is uncontended here; it is taken
+		// because categorizePodForPDGroupLocked requires it.
+		modelServerObj.mutex.Lock()
+		for podName := range modelServerObj.pods {
+			if value, ok := s.pods.Load(podName); ok {
+				modelServerObj.categorizePodForPDGroupLocked(podName, value.(*PodInfo).GetPodLabels())
+			}
+		}
+		modelServerObj.mutex.Unlock()
 	} else {
 		modelServerObj = value.(*modelServer)
 		// Existing object — concurrent readers may access modelServer and pods,
