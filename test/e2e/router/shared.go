@@ -1913,7 +1913,7 @@ func TestRouterConfigUpdateShared(t *testing.T, testCtx *routercontext.RouterTes
 	})
 }
 
-// TestSessionStickyShared implements proposal E2E-SS-01..10 with consistent subtest names E2E_SS_XX_*.
+// TestSessionStickyShared implements proposal E2E-SS-01..10.
 func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestContext, testNamespace string, useGatewayAPI bool, kthenaNamespace string) {
 	if kthenaNamespace == "" {
 		t.Skip("kthena namespace required for router config patch")
@@ -1955,7 +1955,7 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 	messages := []utils.ChatMessage{utils.NewChatMessage("user", "Hi")}
 	utils.WaitForChatModelReady(t, routerConn.URL, created.Spec.ModelName, messages, 5*time.Minute)
 
-	t.Run("E2E_SS_01_SourceStickiness", func(t *testing.T) {
+	t.Run("SourceStickiness", func(t *testing.T) {
 		cases := []struct {
 			name      string
 			urlSuffix string
@@ -1990,7 +1990,7 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 		})
 	})
 
-	t.Run("E2E_SS_02_SessionKeyIsolation", func(t *testing.T) {
+	t.Run("SessionKeyIsolation", func(t *testing.T) {
 		var keyA, keyB string
 		var a, b utils.SessionStickyBackend
 		require.Eventually(t, func() bool {
@@ -2008,7 +2008,7 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 		require.Equal(t, a.Pod, second.Pod, "returning to first session key must not adopt second key binding")
 	})
 
-	t.Run("E2E_SS_03_NoStickyKeyLoadSpread", func(t *testing.T) {
+	t.Run("NoStickyKeyLoadSpread", func(t *testing.T) {
 		seenPods := map[string]struct{}{}
 		for range 8 {
 			got := utils.SessionStickySelectedBackendAfterChatURLHeaders(t, testCtx.KubeClient, kthenaNamespace, routerConn.URL, created.Spec.ModelName, messages, nil)
@@ -2018,7 +2018,7 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 		require.GreaterOrEqual(t, len(seenPods), 2, "without sticky header expect LB spread across pods of the ModelServer")
 	})
 
-	t.Run("E2E_SS_04_NoSessionStickyConfigIgnoresStickyLikeHeader", func(t *testing.T) {
+	t.Run("NoSessionStickyConfigIgnoresStickyLikeHeader", func(t *testing.T) {
 		mr := utils.SessionStickyCreateModelRoute(t, ctx, testCtx.KthenaClient, routercontext.TestDataDir, testNamespace, kthenaNamespace, useGatewayAPI, func(m *networkingv1alpha1.ModelRoute) {
 			m.Name = "deepseek-ss04"
 			m.Spec.ModelName = "deepseek-ss04"
@@ -2038,7 +2038,7 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 		require.GreaterOrEqual(t, len(seen), 2, "ModelServer without sessionSticky must not pin by client header")
 	})
 
-	t.Run("E2E_SS_05_ShortTTLAllowsRebindAfterExpiry", func(t *testing.T) {
+	t.Run("ShortTTLAllowsRebindAfterExpiry", func(t *testing.T) {
 		ttl := int32(2)
 		ms := utils.SessionStickyCreateModelServer(t, ctx, testCtx.KthenaClient, routercontext.TestDataDir, testNamespace, func(m *networkingv1alpha1.ModelServer) {
 			m.Name = "deepseek-sticky-ttl"
@@ -2070,7 +2070,7 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 		utils.SessionStickyWaitBindingExpiredLog(t, testCtx.KubeClient, kthenaNamespace)
 	})
 
-	t.Run("E2E_SS_06_FailoverDeletesStaleBinding", func(t *testing.T) {
+	t.Run("FailoverDeletesStaleBinding", func(t *testing.T) {
 		hdr := map[string]string{"X-Sticky-Session": "ss06-failover"}
 		stickyPod := utils.SessionStickySelectedPodAfterChatURLHeaders(t, testCtx.KubeClient, kthenaNamespace, routerConn.URL, created.Spec.ModelName, messages, hdr)
 		require.NotEmpty(t, stickyPod)
@@ -2086,7 +2086,7 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 		require.NotEqual(t, stickyPod, newPod, "after backend loss same session must not route to deleted pod name")
 	})
 
-	t.Run("E2E_SS_07_AdmissionRejectEmptySources", func(t *testing.T) {
+	t.Run("AdmissionRejectEmptySources", func(t *testing.T) {
 		bad := createdMS.DeepCopy()
 		bad.Name = "e2e-ss07-bad-" + utils.RandomString(5)
 		bad.ResourceVersion = ""
@@ -2095,7 +2095,7 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 		require.Error(t, err)
 	})
 
-	t.Run("E2E_SS_08_PDPairStickinessAndFailover", func(t *testing.T) {
+	t.Run("PDPairStickinessAndFailover", func(t *testing.T) {
 		t.Log("Deploying PD stack for SS-08...")
 		pdServingName := "e2e-ss08-pd-" + utils.RandomString(6)
 		pdModelServerName := pdServingName + "-server"
@@ -2205,7 +2205,7 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 			"making the bound prefill pod unselectable must replace the complete pair")
 	})
 
-	t.Run("E2E_SS_09_StickyDoesNotOverrideModelRouteWeights", func(t *testing.T) {
+	t.Run("StickyDoesNotOverrideModelRouteWeights", func(t *testing.T) {
 		w50 := uint32(50)
 		mr := utils.SessionStickyCreateModelRoute(t, ctx, testCtx.KthenaClient, routercontext.TestDataDir, testNamespace, kthenaNamespace, useGatewayAPI, func(m *networkingv1alpha1.ModelRoute) {
 			m.Name = "deepseek-ss09"
@@ -2247,7 +2247,7 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 		require.GreaterOrEqual(t, len(podsByMS[unstickyMS]), 2, "unsticky ModelServer must not pin; expect pod spread")
 	})
 
-	t.Run("E2E_SS_10_MultiReplicaRedisStickyStore", func(t *testing.T) {
+	t.Run("MultiReplicaRedisStickyStore", func(t *testing.T) {
 		redisCleanup := ensureRedis(t, testCtx.KubeClient, kthenaNamespace)
 		defer redisCleanup()
 
