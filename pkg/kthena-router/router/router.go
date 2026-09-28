@@ -17,7 +17,6 @@ limitations under the License.
 package router
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -1256,8 +1255,42 @@ func proxyRequest(
 	if err != nil {
 		return fmt.Errorf("decode request error: %w", err)
 	}
-	parser := providers.DefaultAdapter().ResponseParser(c, req.URL.Path)
+	path := originalRequestPath(c, req)
+	if isResponsesRequest(c, req) {
+		path = "/v1/responses"
+	}
+	parser := providers.DefaultAdapter().ResponseParser(c, path)
 	return forwardResponseWithUsageParser(c, resp, stream, parser, onUsage)
+}
+
+// originalRequestPath returns the client-facing request path used for wire
+// protocol detection (e.g. selecting the OpenAI Responses vs Chat Completions
+// response parser). It prefers the path recorded by the access-log middleware,
+// which always runs before HTTPRoute matching and so captures the path before
+// any URLRewrite filter can mutate req.URL.Path in place; it falls back to
+// req.URL.Path when no access-log context is set.
+func originalRequestPath(c *gin.Context, req *http.Request) string {
+	if c != nil {
+		if accessCtx := accesslog.GetAccessLogContext(c); accessCtx != nil && accessCtx.Path != "" {
+			return accessCtx.Path
+		}
+	}
+	return req.URL.Path
+}
+
+// isResponsesPath reports whether p targets the OpenAI Responses API endpoint.
+// It mirrors the exact-match convention used by the provider adapters.
+func isResponsesPath(p string) bool {
+	return p == "/v1/responses"
+}
+
+// isResponsesRequest reports whether req targets the OpenAI Responses API. It
+// checks both the original client-facing path and the current (possibly
+// URLRewrite-mutated) request path, so a canonical client using /v1/responses
+// directly and an HTTPRoute that rewrites a custom public path (e.g.
+// /llm/v1/responses) to canonical /v1/responses are both recognized.
+func isResponsesRequest(c *gin.Context, req *http.Request) bool {
+	return isResponsesPath(originalRequestPath(c, req)) || isResponsesPath(req.URL.Path)
 }
 
 func proxyExternalRequest(
@@ -1293,6 +1326,9 @@ func proxyExternalRequest(
 	return nil
 }
 
+// forwardResponseWithUsageParser writes the response status/headers, then forwards
+// the body via the shared parser-driven stream/body helpers in providers, which own
+// the SSE forwarding loop generic over providers.ResponseUsageParser.
 func forwardResponseWithUsageParser(
 	c *gin.Context,
 	resp *http.Response,
@@ -1304,66 +1340,12 @@ func forwardResponseWithUsageParser(
 	c.Status(resp.StatusCode)
 
 	if stream {
-		reader := bufio.NewReader(resp.Body)
-		var streamErr error
-		clientDisconnected := c.Stream(func(w io.Writer) bool {
-			line, err := reader.ReadBytes('\n')
-			if len(line) > 0 {
-				parseResult := parser.ParseStreamLine(string(line))
-				if parseResult.HasUsage {
-					klog.V(4).Infof("Parsed usage: %+v", parseResult.Usage)
-					if onUsage != nil {
-						onUsage(parseResult.Usage)
-					}
-					if parseResult.SuppressLine {
-						return true
-					}
-				}
-				n, writeErr := w.Write(line)
-				if writeErr != nil {
-					klog.Errorf("error writing stream body: %v", writeErr)
-					streamErr = writeErr
-					return false
-				}
-				if n != len(line) {
-					klog.Errorf("error writing stream body: %v", io.ErrShortWrite)
-					streamErr = io.ErrShortWrite
-					return false
-				}
-				parser.RecordStreamLineWritten(string(line))
-			}
-			if err != nil {
-				if err != io.EOF {
-					if !errors.Is(err, context.Canceled) || !parser.StreamCompleted() {
-						klog.Errorf("error reading stream body: %v", err)
-						streamErr = err
-					}
-				}
-				return false
-			}
-			return true
-		})
-		if clientDisconnected && streamErr == nil && !parser.StreamCompleted() {
-			streamErr = context.Canceled
-		}
-		if usage, ok := parser.FinalStreamUsage(); ok && onUsage != nil {
-			onUsage(usage)
-		}
-		return streamErr
-	}
-
-	var buf bytes.Buffer
-	teeReader := io.TeeReader(resp.Body, &buf)
-	if _, err := io.Copy(c.Writer, teeReader); err != nil {
-		klog.Errorf("copy response to downstream failed: %v", err)
+		_, err := providers.ForwardStream(c, resp.Body, parser, onUsage)
 		return err
 	}
 
-	if usage, ok := parser.ParseBody(buf.Bytes()); ok && onUsage != nil {
-		klog.V(4).Infof("Parsed usage: %+v", usage)
-		onUsage(usage)
-	}
-	return nil
+	_, err := providers.ForwardBody(c, resp.Body, parser, onUsage)
+	return err
 }
 
 func isTimeoutError(err error) bool {
@@ -1532,6 +1514,10 @@ func (r *Router) proxyToPDDisaggregated(
 		maxRetry = len(ctx.PrefillPods)
 	}
 
+	// Set when an attempt fails with a captured (not yet written) decode upstream
+	// error, so it can still be forwarded to the client below if every retry fails.
+	var lastResponsesErr *connectors.DecodeUpstreamError
+
 	for i := 0; i < maxRetry; i++ {
 		if ctx.PrefillPods[i] == nil || ctx.DecodePods[i] == nil {
 			continue
@@ -1569,6 +1555,10 @@ func (r *Router) proxyToPDDisaggregated(
 			if c.Writer.Written() {
 				return err
 			}
+			var responsesErr *connectors.DecodeUpstreamError
+			if errors.As(err, &responsesErr) {
+				lastResponsesErr = responsesErr
+			}
 			continue
 		}
 
@@ -1592,6 +1582,16 @@ func (r *Router) proxyToPDDisaggregated(
 	}
 
 	if !c.Writer.Written() {
+		// Every retry failed. If at least one attempt got a real (non-2xx) Responses
+		// upstream response rather than a connection-level failure, forward that
+		// response's actual status/headers/body instead of a generic 500 — this is
+		// the last one observed, matching the existing "last attempt wins" behavior
+		// implicit in this loop (accesslog.SetUpstreamInfo etc. also reflect only
+		// the final attempt).
+		if lastResponsesErr != nil {
+			lastResponsesErr.WriteTo(c)
+			return lastResponsesErr
+		}
 		c.AbortWithStatusJSON(http.StatusInternalServerError, "all prefill/decode attempts failed")
 	}
 	return fmt.Errorf("all prefill/decode attempts failed")
