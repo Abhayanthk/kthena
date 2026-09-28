@@ -641,12 +641,9 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 	var stickyBindingOK bool
 	stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingOK = r.lookupSessionStickyBinding(c, modelServer)
 	stickyBindingFound := stickyBindingOK
-	if stickyBindingOK {
-		if pdGroup != nil {
-			stickyBindingOK = stickyBinding.ValidPD()
-		} else {
-			stickyBindingOK = stickyBinding.PrefillPod == ""
-		}
+	// PD sticky requires a complete Prefill/Decode binding; aggregated uses Pod only.
+	if stickyBindingOK && pdGroup != nil {
+		stickyBindingOK = stickyBinding.ValidPD()
 	}
 
 	ctx := &framework.Context{
@@ -788,12 +785,16 @@ func (r *Router) finalizeSessionSticky(
 	if ctx.PDGroup != nil {
 		if len(ctx.PrefillPods) == 0 || len(ctx.DecodePods) == 0 ||
 			ctx.PrefillPods[0] == nil || ctx.DecodePods[0] == nil {
+			klog.Warningf("session sticky: skip commit for PD modelServer %q: missing selectable prefill/decode pair after schedule (prefill=%d decode=%d)",
+				selectedModelServer, len(ctx.PrefillPods), len(ctx.DecodePods))
 			return
 		}
 		selected.PrefillPod = ctx.PrefillPods[0].GetPodNamespacedName().Name
 		selected.Pod = ctx.DecodePods[0].GetPodNamespacedName().Name
 	} else {
 		if len(ctx.BestPods) == 0 || ctx.BestPods[0].Pod == nil {
+			klog.Warningf("session sticky: skip commit for modelServer %q: no selectable pod after schedule",
+				selectedModelServer)
 			return
 		}
 		selected.Pod = ctx.BestPods[0].Pod.Name
