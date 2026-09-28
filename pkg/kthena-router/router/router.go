@@ -657,9 +657,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 	}
 	if stickyBindingOK {
 		ctx.StickyPodName = stickyBinding.Pod
-		if pdGroup != nil {
-			ctx.StickyPrefillPodName = stickyBinding.PrefillPod
-		}
+		ctx.StickyPrefillPodName = stickyBinding.PrefillPod
 	}
 
 	err = r.scheduler.Schedule(ctx, pods)
