@@ -231,19 +231,13 @@ func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[stri
 		// The Responses API has no equivalent request-side flag: it always returns
 		// usage in the response body (non-streaming) or in whichever terminal event
 		// (response.completed/incomplete/failed) ends the stream, so that field must
-		// not be injected here. When the parsed request still matches the original
-		// body (no model rewrite) replay that body verbatim so opaque Responses
-		// fields are preserved byte-for-byte; otherwise re-marshal the parsed map,
-		// which changes only the model.
-		if raw, ok := unmutatedResponsesBody(c, modelRequest); ok {
-			body = raw
-		} else {
-			marshaled, err := json.Marshal(modelRequest)
-			if err != nil {
-				return nil
-			}
-			body = marshaled
+		// not be injected here. modelRequest is the fully parsed request body, so
+		// re-marshalling it preserves all Responses fields, including opaque ones.
+		marshaled, err := json.Marshal(modelRequest)
+		if err != nil {
+			return nil
 		}
+		body = marshaled
 	} else {
 		modelRequest = AddTokenUsage(c, modelRequest)
 		marshaled, err := json.Marshal(modelRequest)
@@ -314,37 +308,6 @@ func copyResponseHeaders(c *gin.Context, headers http.Header) {
 			c.Header(k, v)
 		}
 	}
-}
-
-// unmutatedResponsesBody returns the original raw request body when it is
-// available on the gin context and still consistent with modelRequest (i.e. the
-// model was not rewritten). It lets BuildDecodeRequest forward a Responses
-// request byte-for-byte instead of re-marshalling the parsed map. It reports
-// false whenever the raw body is missing or no longer matches, so the caller
-// falls back to marshalling modelRequest.
-func unmutatedResponsesBody(c *gin.Context, modelRequest map[string]interface{}) ([]byte, bool) {
-	if c == nil {
-		return nil, false
-	}
-	raw, exists := c.Get(common.RawRequestBodyKey)
-	if !exists {
-		return nil, false
-	}
-	rawBody, ok := raw.([]byte)
-	if !ok || len(rawBody) == 0 {
-		return nil, false
-	}
-	var original struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(rawBody, &original); err != nil {
-		return nil, false
-	}
-	model, _ := modelRequest["model"].(string)
-	if model != original.Model {
-		return nil, false
-	}
-	return rawBody, true
 }
 
 // AddTokenUsage adds token usage to the request body if it is not already present

@@ -609,7 +609,7 @@ func TestBuildDecodeRequestResponsesAPI(t *testing.T) {
 		}
 	})
 
-	t.Run("without model rewrite replays the original raw body", func(t *testing.T) {
+	t.Run("without model rewrite preserves all fields", func(t *testing.T) {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Set(common.RawRequestBodyKey, rawBody)
@@ -623,8 +623,8 @@ func TestBuildDecodeRequestResponsesAPI(t *testing.T) {
 
 		body, err := io.ReadAll(result.Body)
 		require.NoError(t, err)
-		assert.True(t, bytes.Equal(rawBody, body), "raw Responses body must be forwarded byte-for-byte")
-		assert.Equal(t, int64(len(rawBody)), result.ContentLength)
+		assert.JSONEq(t, string(rawBody), string(body), "all Responses fields must be preserved")
+		assert.Equal(t, int64(len(body)), result.ContentLength)
 	})
 
 	t.Run("with model rewrite changes only the model and preserves opaque fields", func(t *testing.T) {

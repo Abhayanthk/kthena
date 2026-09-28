@@ -1567,28 +1567,9 @@ func (r *Router) proxyToPDDisaggregated(
 			r.loadRateLimiter.RecordOutputTokens(ctx.Model, outputTokens)
 		}
 
-		// Update access log with output tokens, same as the aggregated (non-PD) path.
-		accessCtx := accesslog.GetAccessLogContext(c)
-		if accessCtx != nil {
-			accessCtx.SetTokenCounts(accessCtx.InputTokens, outputTokens)
-		}
-
 		// Record output token metrics
 		if metricsRecorder != nil {
 			metricsRecorder.RecordOutputTokens(outputTokens)
-		}
-
-		// Update per-user/model token count for fairness scheduling. kvConnector.Proxy
-		// only returns the decoded output-token count, not the upstream-reported
-		// prompt-token count the aggregated path uses here, so this reuses the
-		// pre-request tokenizer estimate already held in accessCtx.InputTokens (the
-		// same value the access-log update above uses).
-		if userID := c.GetString(common.UserIdKey); userID != "" && ctx.Model != "" {
-			inputTokens := 0
-			if accessCtx != nil {
-				inputTokens = accessCtx.InputTokens
-			}
-			_ = r.store.UpdateTokenCount(userID, ctx.Model, float64(inputTokens), float64(outputTokens))
 		}
 
 		// Record successful operation in cache
