@@ -63,6 +63,11 @@ func NewJWTAuthenticator(routerConfig *conf.RouterConfiguration) *JWTAuthenticat
 		return &JWTAuthenticator{enabled: false}
 	}
 
+	if routerConfig.Auth.Issuer == "" && len(routerConfig.Auth.Audiences) == 0 {
+		klog.Warningf("auth.issuer and auth.audiences are both unset, every token signed by a key from %s will be accepted",
+			routerConfig.Auth.JwksUri)
+	}
+
 	// Create and configure the JWKS rotator
 	rotator := NewJWKSRotator(routerConfig.Auth)
 	if rotator != nil {
@@ -122,6 +127,11 @@ func (j *JWTAuthenticator) validateClaims(token jwt.Token, jwks *Jwks) error {
 }
 
 func (j *JWTAuthenticator) validateIssuer(token jwt.Token, jwks *Jwks) error {
+	if jwks.Issuer == "" {
+		// Nothing to match the token against, same as an unset audiences list.
+		return nil
+	}
+
 	var iss string
 	if err := token.Get("iss", &iss); err != nil || iss != jwks.Issuer {
 		return fmt.Errorf("invalid issuer: expected %s, got %v", jwks.Issuer, iss)
