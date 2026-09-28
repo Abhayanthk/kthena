@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 )
@@ -667,5 +668,64 @@ func TestPDGroupConcurrentModelServerConfigUpdate(t *testing.T) {
 		prefill, err := s.GetPrefillPodsForDecodeGroup(msName, decode[0].GetPodNamespacedName())
 		require.NoError(t, err)
 		require.Len(t, prefill, 1, "both complete configurations have a matching prefill")
+	}
+}
+
+// Pod events can be handled before the event of the ModelServer that selects
+// them. The pods must end up in their PD group either way.
+func TestPDGroupCategorizedRegardlessOfEventOrder(t *testing.T) {
+	tests := []struct {
+		name     string
+		podFirst bool
+	}{
+		{name: "model server first", podFirst: false},
+		{name: "pods first", podFirst: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newStore(&fakePodRuntimeInspector{})
+			ms := newTestModelServerWithPDGroup("test-model", "default")
+			msName := types.NamespacedName{Namespace: ms.Namespace, Name: ms.Name}
+			decode := newTestPod("decode-0", "default", map[string]string{
+				"app": ms.Name, "role": "decode", "pd-group": "group-a",
+			})
+			prefill := newTestPod("prefill-0", "default", map[string]string{
+				"app": ms.Name, "role": "prefill", "pd-group": "group-a",
+			})
+			pods := []*corev1.Pod{decode, prefill}
+			podNames := sets.New(
+				types.NamespacedName{Namespace: "default", Name: "decode-0"},
+				types.NamespacedName{Namespace: "default", Name: "prefill-0"},
+			)
+			servers := []*aiv1alpha1.ModelServer{ms}
+
+			if tt.podFirst {
+				// syncPodHandler runs while the ModelServer is in the lister
+				// but not yet in the store.
+				for _, p := range pods {
+					require.NoError(t, s.AddOrUpdatePod(p, servers))
+				}
+				// syncModelServerHandler: pods already in the store get appended.
+				require.NoError(t, s.AddOrUpdateModelServer(ms, podNames))
+				for _, p := range pods {
+					require.NoError(t, s.AppendModelServerToPod(p, servers))
+				}
+			} else {
+				require.NoError(t, s.AddOrUpdateModelServer(ms, podNames))
+				for _, p := range pods {
+					require.NoError(t, s.AddOrUpdatePod(p, servers))
+				}
+			}
+			decodePods, err := s.GetDecodePods(msName)
+			require.NoError(t, err)
+			require.Len(t, decodePods, 1)
+			assert.Equal(t, "decode-0", decodePods[0].GetPodNamespacedName().Name)
+
+			prefillPods, err := s.GetPrefillPodsForDecodeGroup(msName,
+				types.NamespacedName{Namespace: "default", Name: "decode-0"})
+			require.NoError(t, err)
+			require.Len(t, prefillPods, 1)
+			assert.Equal(t, "prefill-0", prefillPods[0].GetPodNamespacedName().Name)
+		})
 	}
 }
