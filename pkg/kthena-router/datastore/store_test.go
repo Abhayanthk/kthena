@@ -32,10 +32,10 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
@@ -430,7 +430,7 @@ func TestStoreAddOrUpdatePod(t *testing.T) {
 		podInfo := value.(*PodInfo)
 		for _, ms := range modelServers {
 			msName := utils.GetNamespaceName(ms)
-			assert.True(t, podInfo.modelServer.Contains(msName))
+			assert.True(t, podInfo.modelServer.Has(msName))
 		}
 		assert.Equal(t, podInfo.Pod.Name, pod.Name, "pod should be stored correctly")
 		assert.Equal(t, podInfo.modelServer.Len(), 2, "pod should reference both model servers")
@@ -444,8 +444,8 @@ func TestStoreAddOrUpdatePod(t *testing.T) {
 
 	if value, ok := s.pods.Load(podName); ok {
 		podInfo := value.(*PodInfo)
-		assert.True(t, podInfo.modelServer.Contains(utils.GetNamespaceName(ms1)))
-		assert.False(t, podInfo.modelServer.Contains(utils.GetNamespaceName(ms2)))
+		assert.True(t, podInfo.modelServer.Has(utils.GetNamespaceName(ms1)))
+		assert.False(t, podInfo.modelServer.Has(utils.GetNamespaceName(ms2)))
 	}
 
 	// Check model server references
@@ -487,7 +487,7 @@ func TestStoreDeletePod(t *testing.T) {
 	assert.NoError(t, err)
 	_, exists := s.pods.Load(podName)
 	assert.False(t, exists, "pod should be deleted from store")
-	assert.False(t, ms.pods.Contains(podName), "pod should be removed from modelServer set")
+	assert.False(t, ms.pods.Has(podName), "pod should be removed from modelServer set")
 
 	// Delete non-existent pod
 	err = s.DeletePod(types.NamespacedName{Namespace: "default", Name: "notfound"})
@@ -523,8 +523,8 @@ func TestStoreDeletePod_MultiModelServers(t *testing.T) {
 
 	err := s.DeletePod(podName)
 	assert.NoError(t, err)
-	assert.False(t, ms1.pods.Contains(podName))
-	assert.False(t, ms2.pods.Contains(podName))
+	assert.False(t, ms1.pods.Has(podName))
+	assert.False(t, ms2.pods.Has(podName))
 }
 
 func TestStoreAddOrUpdateModelServer(t *testing.T) {
@@ -545,7 +545,7 @@ func TestStoreAddOrUpdateModelServer(t *testing.T) {
 	if value, ok := s.modelServer.Load(msName); ok {
 		msInfo := value.(*modelServer)
 		assert.NotNil(t, msInfo)
-		assert.True(t, msInfo.pods.Contains(types.NamespacedName{Namespace: "default", Name: "pod1"}))
+		assert.True(t, msInfo.pods.Has(types.NamespacedName{Namespace: "default", Name: "pod1"}))
 	} else {
 		t.Errorf("ModelServer not found in store")
 	}
@@ -557,8 +557,8 @@ func TestStoreAddOrUpdateModelServer(t *testing.T) {
 
 	if value, ok := s.modelServer.Load(msName); ok {
 		msInfo := value.(*modelServer)
-		assert.True(t, msInfo.pods.Contains(types.NamespacedName{Namespace: "default", Name: "pod2"}))
-		assert.False(t, msInfo.pods.Contains(types.NamespacedName{Namespace: "default", Name: "pod1"}))
+		assert.True(t, msInfo.pods.Has(types.NamespacedName{Namespace: "default", Name: "pod2"}))
+		assert.False(t, msInfo.pods.Has(types.NamespacedName{Namespace: "default", Name: "pod1"}))
 	}
 }
 
@@ -589,9 +589,96 @@ func TestStoreDeleteModelServer(t *testing.T) {
 	assert.NoError(t, err)
 	_, exists := s.modelServer.Load(msName)
 	assert.False(t, exists, "modelServer should be deleted")
-	assert.False(t, podInfo.modelServer.Contains(msName), "modelServer ref should be removed from podInfo")
+	assert.False(t, podInfo.modelServer.Has(msName), "modelServer ref should be removed from podInfo")
 	_, podExists := s.pods.Load(podName)
 	assert.False(t, podExists, "pod should be deleted if no modelServer left")
+}
+
+func TestStoreDeleteModelServerEmitsPodDeleteEvent(t *testing.T) {
+	newMS := func(name string) *aiv1alpha1.ModelServer {
+		return &aiv1alpha1.ModelServer{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
+		}
+	}
+	podName := types.NamespacedName{Namespace: "default", Name: "pod1"}
+
+	t.Run("pod evicted with its last model server fires the delete event", func(t *testing.T) {
+		s := &store{
+			modelServer: sync.Map{},
+			pods:        sync.Map{},
+			callbacks:   make(map[string][]CallbackFunc),
+		}
+		ms := newMS("model1")
+		msName := utils.GetNamespaceName(ms)
+		modelSrv := newModelServer(ms)
+		modelSrv.addPod(podName)
+		s.modelServer.Store(msName, modelSrv)
+		s.pods.Store(podName, &PodInfo{
+			Pod:         &corev1.Pod{},
+			modelServer: sets.New[types.NamespacedName](msName),
+			models:      sets.New[string](),
+		})
+
+		var mu sync.Mutex
+		var deleted []types.NamespacedName
+		var seenInStore atomic.Bool
+		s.RegisterCallback("Pod", func(data EventData) {
+			if data.EventType != EventDelete {
+				return
+			}
+			if _, ok := s.pods.Load(data.Pod); ok {
+				seenInStore.Store(true)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			deleted = append(deleted, data.Pod)
+		})
+
+		assert.NoError(t, s.DeleteModelServer(msName))
+
+		_, podExists := s.pods.Load(podName)
+		assert.False(t, podExists, "pod should be deleted if no modelServer left")
+		assert.Eventually(t, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(deleted) == 1 && deleted[0] == podName
+		}, time.Second, 10*time.Millisecond, "Pod delete event should fire for the evicted pod")
+		assert.False(t, seenInStore.Load(), "pod should already be out of the store when the event is dispatched")
+	})
+
+	t.Run("pod kept by another model server fires no event", func(t *testing.T) {
+		s := &store{
+			modelServer: sync.Map{},
+			pods:        sync.Map{},
+			callbacks:   make(map[string][]CallbackFunc),
+		}
+		deletedMS, keptMS := newMS("model1"), newMS("model2")
+		deletedName, keptName := utils.GetNamespaceName(deletedMS), utils.GetNamespaceName(keptMS)
+		for ms, name := range map[*aiv1alpha1.ModelServer]types.NamespacedName{deletedMS: deletedName, keptMS: keptName} {
+			modelSrv := newModelServer(ms)
+			modelSrv.addPod(podName)
+			s.modelServer.Store(name, modelSrv)
+		}
+		s.pods.Store(podName, &PodInfo{
+			Pod:         &corev1.Pod{},
+			modelServer: sets.New[types.NamespacedName](deletedName, keptName),
+			models:      sets.New[string](),
+		})
+
+		var fired atomic.Bool
+		s.RegisterCallback("Pod", func(data EventData) {
+			if data.EventType == EventDelete {
+				fired.Store(true)
+			}
+		})
+
+		assert.NoError(t, s.DeleteModelServer(deletedName))
+
+		_, podExists := s.pods.Load(podName)
+		assert.True(t, podExists, "pod should stay while another modelServer still selects it")
+		assert.Never(t, fired.Load, 100*time.Millisecond, 10*time.Millisecond,
+			"no Pod delete event should fire while the pod is still in the store")
+	})
 }
 
 func TestStoreGetPodsByModelServer(t *testing.T) {
@@ -1806,7 +1893,7 @@ func TestAddOrUpdateModelRoute_UpdatesGatewayRoutes(t *testing.T) {
 	s.routeMutex.RLock()
 	_, exists := s.gatewayModelRoutes["default/gateway-a"]
 	assert.False(t, exists)
-	assert.True(t, s.gatewayModelRoutes["default/gateway-b"].Contains("default/route"))
+	assert.True(t, s.gatewayModelRoutes["default/gateway-b"].Has("default/route"))
 	s.routeMutex.RUnlock()
 }
 
@@ -1992,7 +2079,7 @@ func TestAddOrUpdatePod_MetricsPreservedOnUpdate(t *testing.T) {
 
 			models := podInfo.GetModels()
 			for _, m := range tc.wantModels {
-				assert.True(t, models.Contains(m), "model %s lost after pod update", m)
+				assert.True(t, models.Has(m), "model %s lost after pod update", m)
 			}
 			assert.Equal(t, len(tc.wantModels), models.Len(),
 				"model count changed after pod update")
@@ -2098,7 +2185,7 @@ func TestAddOrUpdatePod_ModelServerChangePreservesMetrics(t *testing.T) {
 		"TTFT lost during model server reassignment")
 
 	models := podInfo.GetModels()
-	assert.True(t, models.Contains("model-a"), "model lost during model server reassignment")
+	assert.True(t, models.Has("model-a"), "model lost during model server reassignment")
 }
 
 func TestSelectDestination_EmptyTargets(t *testing.T) {
@@ -2904,5 +2991,65 @@ func BenchmarkSelectRuleRegex(b *testing.B) {
 		if _, err := s.selectRule("m", req, rules); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestGetPodWorkloadPort(t *testing.T) {
+	workloadPort := int32(8000)
+	endpointPort := "9000"
+
+	tests := []struct {
+		name         string
+		workloadPort int32
+		annotations  map[string]string
+		expected     uint32
+	}{
+		{
+			name:         "workload port only",
+			workloadPort: workloadPort,
+			expected:     8000,
+		},
+		{
+			name:         "endpoint port overrides workload port",
+			workloadPort: workloadPort,
+			annotations:  map[string]string{utils.EndpointPortAnnotation: endpointPort},
+			expected:     9000,
+		},
+		{
+			// Static endpoints may declare every port per endpoint, leaving
+			// spec.workloadPort unset.
+			name:        "endpoint port without workload port",
+			annotations: map[string]string{utils.EndpointPortAnnotation: endpointPort},
+			expected:    9000,
+		},
+		{
+			name:     "no port configured",
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New().(*store)
+			ms := &aiv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ms"},
+				Spec: aiv1alpha1.ModelServerSpec{
+					WorkloadPort: aiv1alpha1.WorkloadPort{Port: tt.workloadPort},
+				},
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   "default",
+					Name:        "pod1",
+					Annotations: tt.annotations,
+				},
+			}
+			assert.NoError(t, s.AddOrUpdateModelServer(ms, nil))
+			assert.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+
+			podInfo := s.GetPodInfo(utils.GetNamespaceName(pod))
+			assert.NotNil(t, podInfo)
+			assert.Equal(t, tt.expected, s.getPodWorkloadPort(podInfo))
+		})
 	}
 }

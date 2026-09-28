@@ -25,9 +25,9 @@ import (
 	"reflect"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	apiextClientSet "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -109,8 +110,8 @@ type ModelServingController struct {
 	// nolint
 	workqueue       workqueue.RateLimitingInterface
 	store           datastore.Store
-	graceMap        sync.Map // key: podGracePeriodKey, value:time
-	initialSync     bool     // indicates whether the initial sync has been completed
+	graceMap        sync.Map    // key: podGracePeriodKey, value:time
+	initialSync     atomic.Bool // indicates whether the initial sync has been completed
 	pluginsRegistry *plugins.Registry
 	recorder        record.EventRecorder
 }
@@ -372,7 +373,7 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 		}
 	default:
 		klog.V(4).Infof("handleDefault: %s/%s", newPod.Namespace, newPod.Name)
-		if !c.initialSync {
+		if !c.initialSync.Load() {
 			roleName := utils.GetRoleName(newPod)
 			roleTemplateHash := c.resolveRoleTemplateHash(ms, roleName, newPod)
 			c.store.AddServingGroupAndRole(types.NamespacedName{
@@ -637,7 +638,7 @@ func (c *ModelServingController) syncAll() {
 		c.addModelServing(ms)
 	}
 
-	c.initialSync = true
+	c.initialSync.Store(true)
 }
 
 // syncServingGroupReplicas scales up or down whole ServingGroups to meet the top-level
@@ -934,7 +935,7 @@ func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloa
 		protectedScores = make([]RoleWithScore, 0, len(allScores))
 		nonProtectedScores = make([]RoleWithScore, 0, len(allScores))
 		for _, score := range allScores {
-			if protectedRoleNames.Contains(score.Name) {
+			if protectedRoleNames.Has(score.Name) {
 				protectedScores = append(protectedScores, score)
 			} else {
 				nonProtectedScores = append(nonProtectedScores, score)
@@ -1570,7 +1571,7 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv
 		if len(protected) > 0 && len(outdatedRoles) > 0 {
 			filtered := outdatedRoles[:0]
 			for _, r := range outdatedRoles {
-				if protected.Contains(r.Name) {
+				if protected.Has(r.Name) {
 					continue
 				}
 				filtered = append(filtered, r)
@@ -1581,7 +1582,7 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv
 			if len(protected) > 0 {
 				expectedHash := utils.CalRoleTemplateHash(roleSpec)
 				for _, role := range roleList {
-					if !protected.Contains(role.Name) {
+					if !protected.Has(role.Name) {
 						continue
 					}
 					if role.Status == datastore.RoleDeleting {
@@ -2558,7 +2559,7 @@ func (c *ModelServingController) scaleDownServingGroups(ctx context.Context, ms 
 	var protectedScores []ServingGroupWithScore
 	var nonProtectedScores []ServingGroupWithScore
 	for _, score := range allScores {
-		if protectedGroupNames.Contains(score.Name) {
+		if protectedGroupNames.Has(score.Name) {
 			protectedScores = append(protectedScores, score)
 		} else {
 			nonProtectedScores = append(nonProtectedScores, score)

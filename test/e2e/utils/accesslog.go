@@ -72,40 +72,37 @@ func parseTextRouterAccessLog(line string) (accesslog.AccessLogEntry, bool) {
 	}
 	entry.Timestamp, _ = time.Parse(time.RFC3339Nano, line[1:closingBracket])
 
+	// String values may be quoted, and a quoted one can hold spaces, so read them
+	// by field name rather than by splitting the line on whitespace.
+	for name, target := range map[string]*string{
+		"model_name":     &entry.ModelName,
+		"model_route":    &entry.ModelRoute,
+		"model_server":   &entry.ModelServer,
+		"selected_pod":   &entry.SelectedPod,
+		"request_id":     &entry.RequestID,
+		"backend_type":   &entry.BackendType,
+		"backend_name":   &entry.BackendName,
+		"upstream_model": &entry.UpstreamModel,
+		"error_origin":   &entry.ErrorOrigin,
+		"gateway":        &entry.Gateway,
+		"http_route":     &entry.HTTPRoute,
+		"inference_pool": &entry.InferencePool,
+	} {
+		if value, ok := textAccessLogField(line, name); ok {
+			*target = unquoteTextAccessLogValue(value)
+		}
+	}
+
 	for _, field := range remainder[1:] {
 		key, value, ok := strings.Cut(field, "=")
 		if !ok {
 			continue
 		}
 		switch key {
-		case "model_name":
-			entry.ModelName = value
-		case "model_route":
-			entry.ModelRoute = value
-		case "model_server":
-			entry.ModelServer = value
-		case "selected_pod":
-			entry.SelectedPod = value
-		case "request_id":
-			entry.RequestID = value
-		case "backend_type":
-			entry.BackendType = value
-		case "backend_name":
-			entry.BackendName = value
-		case "upstream_model":
-			entry.UpstreamModel = value
 		case "upstream_status_code":
 			entry.UpstreamStatusCode, _ = strconv.Atoi(value)
 		case "upstream_attempts":
 			entry.UpstreamAttempts, _ = strconv.Atoi(value)
-		case "error_origin":
-			entry.ErrorOrigin = value
-		case "gateway":
-			entry.Gateway = value
-		case "http_route":
-			entry.HTTPRoute = value
-		case "inference_pool":
-			entry.InferencePool = value
 		case "tokens":
 			_, _ = fmt.Sscanf(value, "%d/%d", &entry.InputTokens, &entry.OutputTokens)
 		case "timings":
@@ -118,7 +115,7 @@ func parseTextRouterAccessLog(line string) (accesslog.AccessLogEntry, bool) {
 		}
 	}
 	if value, ok := textAccessLogField(line, "error"); ok {
-		errorType, message, _ := strings.Cut(value, ":")
+		errorType, message, _ := strings.Cut(unquoteTextAccessLogValue(value), ":")
 		entry.Error = &accesslog.ErrorInfo{Type: errorType, Message: message}
 	}
 	return entry, isRouterAccessLogEntry(entry)
@@ -142,6 +139,16 @@ var textAccessLogFieldNames = []string{
 	"inference_pool",
 	"tokens",
 	"timings",
+}
+
+func unquoteTextAccessLogValue(value string) string {
+	if !strings.HasPrefix(value, `"`) {
+		return value
+	}
+	if unquoted, err := strconv.Unquote(value); err == nil {
+		return unquoted
+	}
+	return value
 }
 
 func textAccessLogField(line, name string) (string, bool) {

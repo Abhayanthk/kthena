@@ -38,10 +38,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
-	"istio.io/istio/pkg/util/sets"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
 	inferencev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
@@ -104,7 +105,7 @@ func setupTestRouter(t *testing.T, backendHandler http.Handler) (*Router, datast
 
 	backend := httptest.NewServer(withMetricsEndpoint(backendHandler))
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 
 	return router, store, backend
 }
@@ -781,6 +782,67 @@ func TestRouter_HandlerFunc_AggregatedMode(t *testing.T) {
 	assert.Equal(t, float64(1), requestCounterValue(t, router, "test-model", "/v1/chat/completions", "200", "successful_request")-requestsBefore)
 }
 
+// TestRouter_HandlerFunc_UsesPerModelServerTransport verifies that when a
+// ModelServer has a per-ModelServer transport registered, the aggregated
+// forwarding path uses it instead of the shared default and still succeeds.
+func TestRouter_HandlerFunc_UsesPerModelServerTransport(t *testing.T) {
+	backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"per-ms-response"}`)
+	})
+	router, store, backend := setupTestRouter(t, backendHandler)
+	defer backend.Close()
+
+	backendURL, _ := url.Parse(backend.URL)
+	backendIP := backendURL.Hostname()
+	backendPort, _ := strconv.Atoi(backendURL.Port())
+
+	msName := types.NamespacedName{Name: "ms-pool", Namespace: "default"}
+	perHost := int32(128)
+	modelServer := &aiv1alpha1.ModelServer{
+		ObjectMeta: v1.ObjectMeta{Name: "ms-pool", Namespace: "default"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			Model:           func(s string) *string { return &s }("test-model-base"),
+			WorkloadPort:    aiv1alpha1.WorkloadPort{Port: int32(backendPort)},
+			InferenceEngine: "vLLM",
+			TrafficPolicy: &aiv1alpha1.TrafficPolicy{
+				ConnectionPool: &aiv1alpha1.ConnectionPool{MaxIdleConnectionsPerHost: &perHost},
+			},
+		},
+	}
+	pod1 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-pool", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: backendIP, Phase: corev1.PodRunning},
+	}
+	modelRoute := &aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-pool", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "test-model",
+			Rules:     []*aiv1alpha1.Rule{{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms-pool"}}}},
+		},
+	}
+
+	store.AddOrUpdateModelServer(modelServer, sets.New(types.NamespacedName{Name: "pod-pool", Namespace: "default"}))
+	store.AddOrUpdatePod(pod1, []*aiv1alpha1.ModelServer{modelServer})
+	store.AddOrUpdateModelRoute(modelRoute)
+
+	// Populate the registry as the controller would on a ModelServer update.
+	router.transportRegistry.Update(msName, &aiv1alpha1.ConnectionPool{MaxIdleConnectionsPerHost: &perHost})
+	rt := router.transportFor(msName)
+	require.NotNil(t, rt, "per-ModelServer transport should be registered")
+	assert.Equal(t, 128, rt.MaxIdleConnsPerHost)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"test-model","prompt":"hi"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"id":"per-ms-response"`)
+}
+
 func TestRouter_HandlerFunc_InferencePoolAccessLogDestination(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -915,7 +977,7 @@ func TestRouter_HandlerFunc_ExternalOpenAIProvider(t *testing.T) {
 	defer upstream.Close()
 
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
 		Spec: aiv1alpha1.ExternalModelProviderSpec{
@@ -987,7 +1049,7 @@ func TestRouter_HandlerFunc_ExternalOpenAIResponsesProvider(t *testing.T) {
 	defer upstream.Close()
 
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: v1.ObjectMeta{Name: "responses-provider", Namespace: "default"},
 		Spec: aiv1alpha1.ExternalModelProviderSpec{
@@ -1057,7 +1119,7 @@ func TestRouter_HandlerFunc_ExternalAnthropicProvider(t *testing.T) {
 	defer upstream.Close()
 
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: v1.ObjectMeta{Name: "anthropic-provider", Namespace: "default"},
 		Spec: aiv1alpha1.ExternalModelProviderSpec{
@@ -1111,7 +1173,7 @@ func TestRouter_HandlerFunc_ExternalAnthropicProvider(t *testing.T) {
 
 func TestRouter_HandlerFunc_ExternalProviderProtocolMismatch(t *testing.T) {
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
 		Spec: aiv1alpha1.ExternalModelProviderSpec{
@@ -1149,7 +1211,7 @@ func TestRouter_HandlerFunc_ExternalProviderProtocolMismatch(t *testing.T) {
 
 func TestRouter_HandlerFunc_ExternalProviderMissingSecret(t *testing.T) {
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
 		Spec: aiv1alpha1.ExternalModelProviderSpec{
@@ -1193,7 +1255,7 @@ func TestRouter_HandlerFunc_ExternalProviderMissingSecret(t *testing.T) {
 
 func TestRouter_HandlerFunc_ExternalProviderMissingSecretKey(t *testing.T) {
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
 		Spec: aiv1alpha1.ExternalModelProviderSpec{
@@ -1253,7 +1315,7 @@ func TestRouter_HandlerFunc_ExternalProviderPreservesRawBodyWhenUnchanged(t *tes
 	defer upstream.Close()
 
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: v1.ObjectMeta{Name: "anthropic-provider", Namespace: "default"},
 		Spec: aiv1alpha1.ExternalModelProviderSpec{
@@ -1296,7 +1358,7 @@ func TestRouter_HandlerFunc_ExternalProviderPassesThroughNon2xx(t *testing.T) {
 	defer upstream.Close()
 
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
 		Spec: aiv1alpha1.ExternalModelProviderSpec{
@@ -1337,7 +1399,7 @@ func TestRouter_HandlerFunc_ExternalProviderPassesThroughNon2xx(t *testing.T) {
 
 func TestRouter_HandlerFunc_ExternalProviderInvalidConfiguration(t *testing.T) {
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: v1.ObjectMeta{Name: "invalid-provider", Namespace: "default"},
 		Spec: aiv1alpha1.ExternalModelProviderSpec{
@@ -1379,7 +1441,7 @@ func TestRouter_HandlerFunc_ExternalProviderResponseForwardingFailure(t *testing
 	defer upstream.Close()
 
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
 		Spec: aiv1alpha1.ExternalModelProviderSpec{
@@ -1961,7 +2023,7 @@ func TestRouter_HandlerFunc_Responses_InferencePool_URLRewrite(t *testing.T) {
 	}))
 	defer backend.Close()
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 
 	backendURL, _ := url.Parse(backend.URL)
 	backendPort, _ := strconv.Atoi(backendURL.Port())
@@ -2043,7 +2105,7 @@ func TestRouter_HandlerFunc_Responses_InferencePool_URLRewrite_CustomPublicPath(
 	}))
 	defer backend.Close()
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 
 	backendURL, _ := url.Parse(backend.URL)
 	backendPort, _ := strconv.Atoi(backendURL.Port())
@@ -3064,7 +3126,7 @@ func TestProxy_RetryBodyNotDrained(t *testing.T) {
 	backendPort, _ := strconv.Atoi(backendURL.Port())
 
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 
 	modelServer := &aiv1alpha1.ModelServer{
 		ObjectMeta: v1.ObjectMeta{Name: "ms-retry", Namespace: "default"},
@@ -3554,7 +3616,7 @@ func TestDoRequestBoundsConnectionSetup(t *testing.T) {
 	assert.NoError(t, err)
 
 	start := time.Now()
-	_, err = doRequest(req, host, int32(port), 200*time.Millisecond)
+	_, err = doRequest(req, host, int32(port), 200*time.Millisecond, proxyTransport)
 	elapsed := time.Since(start)
 
 	assert.Error(t, err)
@@ -3578,7 +3640,7 @@ func TestDoRequestHonorsTimeout(t *testing.T) {
 	assert.NoError(t, err)
 
 	start := time.Now()
-	_, err = doRequest(req, host, port, 300*time.Millisecond)
+	_, err = doRequest(req, host, port, 300*time.Millisecond, proxyTransport)
 	elapsed := time.Since(start)
 
 	assert.Error(t, err, "a stalled backend should fail once the timeout elapses")
@@ -3602,7 +3664,7 @@ func TestDoRequestWithoutTimeoutStillWaits(t *testing.T) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, backend.URL+"/v1/chat/completions", strings.NewReader("{}"))
 	assert.NoError(t, err)
 
-	_, err = doRequest(req, host, port, 0)
+	_, err = doRequest(req, host, port, 0, proxyTransport)
 	assert.Error(t, err, "without a policy timeout only the request context bounds the call")
 	close(release)
 }
@@ -3639,7 +3701,7 @@ func TestDoRequestTimeoutDoesNotTruncateSlowStream(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Body takes ~600ms, well past the 200ms header timeout
-	resp, err := doRequest(req, host, port, 200*time.Millisecond)
+	resp, err := doRequest(req, host, port, 200*time.Millisecond, proxyTransport)
 	assert.NoError(t, err)
 	defer resp.Body.Close()
 
@@ -3805,7 +3867,7 @@ func TestRouter_ProxyToPDDisaggregated_RetryBehavior(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := datastore.New()
-			router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+			router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 
 			ctx := &framework.Context{
 				Model:       "test-model",
@@ -3858,7 +3920,7 @@ func TestRouter_ProxyToPDDisaggregated_DecodeUpstreamError(t *testing.T) {
 
 	t.Run("retries the second pod pair instead of stopping on the first non-2xx", func(t *testing.T) {
 		store := datastore.New()
-		router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+		router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 		ctx := &framework.Context{
 			Model:       "responses-model",
 			PrefillPods: []*datastore.PodInfo{info1, info2},
@@ -3897,7 +3959,7 @@ func TestRouter_ProxyToPDDisaggregated_DecodeUpstreamError(t *testing.T) {
 
 	t.Run("forwards the last attempt's real status, body, and headers once retries are exhausted", func(t *testing.T) {
 		store := datastore.New()
-		router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+		router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 		ctx := &framework.Context{
 			Model:       "responses-model",
 			PrefillPods: []*datastore.PodInfo{info1, info2},

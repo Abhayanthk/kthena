@@ -850,7 +850,7 @@ func TestPrefillerProxy(t *testing.T) {
 			require.NoError(t, err)
 			testReq.Header.Set("Content-Type", "application/json")
 
-			err = prefillerProxy(c, testReq, 0)
+			err = prefillerProxy(testReq, 0, upstreamTransport)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -880,7 +880,7 @@ func TestPrefillerProxyHonorsTimeout(t *testing.T) {
 	require.NoError(t, err)
 
 	start := time.Now()
-	err = prefillerProxy(nil, req, 100*time.Millisecond)
+	err = prefillerProxy(req, 100*time.Millisecond, upstreamTransport)
 
 	assert.Error(t, err)
 	assert.Less(t, time.Since(start), time.Second)
@@ -958,7 +958,7 @@ func TestDecoderProxy(t *testing.T) {
 			require.NoError(t, err)
 			testReq.Header.Set("Content-Type", "application/json")
 
-			_, err = decoderProxy(c, testReq, 0)
+			_, err = decoderProxy(c, testReq, 0, upstreamTransport)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -997,7 +997,7 @@ func TestDecoderProxyResponsesAPINonStreaming(t *testing.T) {
 	testReq, err := http.NewRequest("POST", server.URL+"/v1/responses", bytes.NewBufferString(`{"model":"m","input":"hi"}`))
 	require.NoError(t, err)
 
-	outputTokens, err := decoderProxy(c, testReq, 0)
+	outputTokens, err := decoderProxy(c, testReq, 0, upstreamTransport)
 	require.NoError(t, err)
 
 	assert.Equal(t, 7, outputTokens, "output_tokens must be extracted from the Responses usage object")
@@ -1044,7 +1044,7 @@ func TestDecoderProxyResponsesAPIStreaming(t *testing.T) {
 			testReq, err := http.NewRequest("POST", server.URL+"/v1/responses", bytes.NewBufferString(`{"model":"m","input":"hi","stream":true}`))
 			require.NoError(t, err)
 
-			outputTokens, err := decoderProxy(c, testReq, 0)
+			outputTokens, err := decoderProxy(c, testReq, 0, upstreamTransport)
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.wantTokens, outputTokens)
@@ -1080,7 +1080,7 @@ func TestDecoderProxyResponsesAPINonStreamingErrorDoesNotWritePrematurely(t *tes
 	testReq, err := http.NewRequest("POST", server.URL+"/v1/responses", bytes.NewBufferString(`{"model":"m","input":"hi"}`))
 	require.NoError(t, err)
 
-	outputTokens, err := decoderProxy(c, testReq, 0)
+	outputTokens, err := decoderProxy(c, testReq, 0, upstreamTransport)
 
 	// The error is returned, not written: the PD retry loop must still be able to try
 	// another prefill/decode pair (c.Writer.Written() must stay false here).
@@ -1131,7 +1131,7 @@ func TestDecoderProxyResponsesAPIUsesOriginalPathAfterURLRewrite(t *testing.T) {
 	testReq, err := http.NewRequest("POST", server.URL+"/rewritten/backend-path", bytes.NewBufferString(`{"model":"m","input":"hi"}`))
 	require.NoError(t, err)
 
-	outputTokens, err := decoderProxy(c, testReq, 0)
+	outputTokens, err := decoderProxy(c, testReq, 0, upstreamTransport)
 	require.NoError(t, err)
 
 	assert.Equal(t, 7, outputTokens, "Responses usage parsing must apply based on the original "+
@@ -1167,7 +1167,7 @@ func TestDecoderProxyResponsesAPIRecognizesRewrittenCanonicalPath(t *testing.T) 
 	testReq, err := http.NewRequest("POST", server.URL+"/v1/responses", bytes.NewBufferString(`{"model":"m","input":"hi"}`))
 	require.NoError(t, err)
 
-	outputTokens, err := decoderProxy(c, testReq, 0)
+	outputTokens, err := decoderProxy(c, testReq, 0, upstreamTransport)
 	require.NoError(t, err)
 
 	assert.Equal(t, 7, outputTokens, "Responses usage parsing must apply once req.URL.Path is "+
@@ -1191,7 +1191,7 @@ func TestDecoderProxyChatCompletionsUnchanged(t *testing.T) {
 		testReq, err := http.NewRequest("POST", server.URL+"/v1/chat/completions", bytes.NewBufferString(`{"model":"m"}`))
 		require.NoError(t, err)
 
-		outputTokens, err := decoderProxy(c, testReq, 0)
+		outputTokens, err := decoderProxy(c, testReq, 0, upstreamTransport)
 		require.NoError(t, err)
 		assert.Equal(t, 9, outputTokens)
 	})
@@ -1210,7 +1210,7 @@ func TestDecoderProxyChatCompletionsUnchanged(t *testing.T) {
 		testReq, err := http.NewRequest("POST", server.URL+"/v1/chat/completions", bytes.NewBufferString(`{"model":"m","stream":true}`))
 		require.NoError(t, err)
 
-		outputTokens, err := decoderProxy(c, testReq, 0)
+		outputTokens, err := decoderProxy(c, testReq, 0, upstreamTransport)
 		require.NoError(t, err)
 		assert.Equal(t, 9, outputTokens)
 		assert.Contains(t, w.Body.String(), "data: [DONE]")
@@ -1232,7 +1232,7 @@ func TestDecoderProxyTimeoutDoesNotTruncateStream(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
 	require.NoError(t, err)
 
-	_, err = decoderProxy(c, req, 50*time.Millisecond)
+	_, err = decoderProxy(c, req, 50*time.Millisecond, upstreamTransport)
 
 	assert.NoError(t, err)
 	assert.Contains(t, w.Body.String(), "data: [DONE]")

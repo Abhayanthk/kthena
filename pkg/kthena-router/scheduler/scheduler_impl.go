@@ -195,6 +195,17 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 		return err
 	}
 
+	if ctx.StickyPodName != "" {
+		for _, p := range pods {
+			if p.Pod != nil && p.Pod.Name == ctx.StickyPodName {
+				// Sticky pod already passed filters; skip score plugins.
+				ctx.BestPods = []*datastore.PodInfo{p}
+				return nil
+			}
+		}
+		ctx.StickyPodName = ""
+	}
+
 	klog.V(4).Info("Running score plugins for PD aggregated pod")
 	scores := s.RunScorePlugins(pods, ctx)
 	ctx.BestPods = TopNPodInfos(scores, topN)

@@ -52,6 +52,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/plugins/conf"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/sessionsticky"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
 
@@ -106,6 +107,10 @@ type Router struct {
 	// KV Connector management
 	connectorFactory *connectors.Factory
 
+	// Per-ModelServer upstream transports (nil entries fall back to shared
+	// proxyTransport/upstreamTransport).
+	transportRegistry *common.TransportRegistry
+
 	// Priority queue configuration
 	queueTimeout     time.Duration
 	tokenWeight      float64 // Weight for token-based priority in the fairness strategy (default 1.0)
@@ -116,6 +121,8 @@ type Router struct {
 	// waiting indefinitely for backend capacity. It defaults to 30s; a non-positive
 	// value disables the timeout (the request is bounded only by client disconnect).
 	sessionBoostTimeout time.Duration
+
+	sessionStickyStore sessionsticky.Store
 }
 
 // ActiveRequestCount returns the number of requests currently being handled by the router.
@@ -123,7 +130,7 @@ func (r *Router) ActiveRequestCount() int64 {
 	return r.metrics.ActiveRequestsCount()
 }
 
-func NewRouter(store datastore.Store, routerConfigPath string) *Router {
+func NewRouter(store datastore.Store, routerConfigPath string, transportRegistry *common.TransportRegistry) *Router {
 	// User fairness and session boost are mutually exclusive scheduling strategies.
 	// Enabling both is a configuration error.
 	if EnableFairnessScheduling && EnableSessionBoost {
@@ -163,6 +170,11 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 		klog.Fatalf("failed to parse router config: %v", err)
 	}
 
+	sessionStickyStore, err := sessionsticky.NewStore(routerConfig.SessionSticky)
+	if err != nil {
+		klog.Fatalf("session sticky store: %v", err)
+	}
+
 	// Initialize access logger with configuration from environment variables
 	accessLogConfig := &accesslog.AccessLoggerConfig{
 		Enabled: true,
@@ -195,19 +207,21 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 	}
 
 	return &Router{
-		store:            store,
-		scheduler:        scheduler.NewScheduler(store, routerConfig),
-		authenticator:    auth.NewJWTAuthenticator(routerConfig),
-		loadRateLimiter:  loadRateLimiter,
-		accessLogger:     accessLogger,
-		metrics:          metricsInstance,
-		tokenizer:        tokenizerInstance,
-		connectorFactory: connectors.NewDefaultFactory(),
-		queueTimeout:     parseQueueTimeout(),
-		tokenWeight:      parseEnvFloat("FAIRNESS_PRIORITY_TOKEN_WEIGHT", 1.0),
-		requestNumWeight: parseEnvFloat("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", 0.0),
+		store:             store,
+		scheduler:         scheduler.NewScheduler(store, routerConfig),
+		authenticator:     auth.NewJWTAuthenticator(routerConfig),
+		loadRateLimiter:   loadRateLimiter,
+		accessLogger:      accessLogger,
+		metrics:           metricsInstance,
+		tokenizer:         tokenizerInstance,
+		connectorFactory:  connectors.NewDefaultFactory(),
+		transportRegistry: transportRegistry,
+		queueTimeout:      parseQueueTimeout(),
+		tokenWeight:       parseEnvFloat("FAIRNESS_PRIORITY_TOKEN_WEIGHT", 1.0),
+		requestNumWeight:  parseEnvFloat("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", 0.0),
 
 		sessionBoostTimeout: parseSessionBoostTimeout(),
+		sessionStickyStore:  sessionStickyStore,
 	}
 }
 
@@ -441,7 +455,6 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 
 	var isLora bool
 	var err error
-	// Try to match ModelRoute first
 	modelTarget, isLora, modelRoute, err = r.store.MatchModelTarget(modelName, c.Request, gatewayKey)
 	if err != nil {
 		accesslog.SetError(c, "model_route_matching", fmt.Sprintf("failed to match model route target: %v", err))
@@ -621,6 +634,23 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		upstreamModelForMetrics = *modelServer.Spec.Model
 	}
 
+	// PD disaggregated models skip session sticky entirely.
+	var stickySpec *v1alpha1.SessionSticky
+	var sessionKey, stickyStoreKey string
+	var stickyBinding sessionsticky.Binding
+	var stickyBindingOK bool
+	stickyHint := ""
+	if pdGroup != nil {
+		if sessionStickyFromModelServer(modelServer) != nil {
+			klog.InfoS("session sticky bypassed for PD disaggregated model", "modelServer", klog.KObj(modelServer))
+		}
+	} else {
+		stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingOK = r.lookupSessionStickyBinding(c, modelServer)
+		if stickyBindingOK {
+			stickyHint = stickyBinding.Pod
+		}
+	}
+
 	ctx := &framework.Context{
 		Model:           modelName,
 		Prompt:          prompt,
@@ -629,6 +659,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		UpstreamModel:   upstreamModelForMetrics,
 		PDGroup:         pdGroup,
 		MetricsRecorder: metricsRecorder,
+		StickyPodName:   stickyHint,
 	}
 
 	err = r.scheduler.Schedule(ctx, pods)
@@ -637,6 +668,8 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		c.AbortWithStatusJSON(http.StatusBadRequest, fmt.Sprintf("can't schedule to target pod: %v", err))
 		return fmt.Errorf("can't schedule to target pod: %v", err)
 	}
+
+	r.finalizeSessionSticky(c, ctx, stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingOK, modelServerName.Name)
 
 	// Set complete request routing information in access log
 	modelServerFullName := ""
@@ -696,6 +729,75 @@ func upstreamTimeoutFor(ms *v1alpha1.ModelServer) time.Duration {
 		return 0
 	}
 	return ms.Spec.TrafficPolicy.Timeout.Duration
+}
+
+// transportFor returns the per-ModelServer upstream transport, or nil when no
+// connectionPool is configured (callers fall back to a shared transport).
+func (r *Router) transportFor(name types.NamespacedName) *http.Transport {
+	if r.transportRegistry == nil {
+		return nil
+	}
+	return r.transportRegistry.Get(name)
+}
+
+func sessionStickyFromModelServer(ms *v1alpha1.ModelServer) *v1alpha1.SessionSticky {
+	if ms == nil || ms.Spec.TrafficPolicy == nil {
+		return nil
+	}
+	return ms.Spec.TrafficPolicy.SessionSticky
+}
+
+func (r *Router) lookupSessionStickyBinding(c *gin.Context, modelServer *v1alpha1.ModelServer) (
+	stickySpec *v1alpha1.SessionSticky, sessionKey, stickyStoreKey string, binding sessionsticky.Binding, ok bool,
+) {
+	stickySpec = sessionStickyFromModelServer(modelServer)
+	if stickySpec == nil || r.sessionStickyStore == nil {
+		return stickySpec, "", "", sessionsticky.Binding{}, false
+	}
+	sessionKey, stickyStoreKey, binding, ok = sessionsticky.LookupBinding(
+		c,
+		types.NamespacedName{Namespace: modelServer.Namespace, Name: modelServer.Name},
+		stickySpec,
+		r.sessionStickyStore,
+	)
+	return stickySpec, sessionKey, stickyStoreKey, binding, ok
+}
+
+// finalizeSessionSticky runs post-schedule session affinity bookkeeping (clear stale bindings, commit winner).
+func (r *Router) finalizeSessionSticky(
+	c *gin.Context,
+	ctx *framework.Context,
+	stickySpec *v1alpha1.SessionSticky,
+	sessionKey, stickyStoreKey string,
+	prev sessionsticky.Binding,
+	prevOK bool,
+	selectedModelServer string,
+) {
+	// No backing store or session key could not be resolved from the request.
+	if r.sessionStickyStore == nil || sessionKey == "" || stickyStoreKey == "" {
+		return
+	}
+
+	// ModelServer has no session sticky or scheduling did not pick a pod to bind.
+	if stickySpec == nil || selectedModelServer == "" || len(ctx.BestPods) == 0 || ctx.BestPods[0].Pod == nil {
+		return
+	}
+
+	selected := sessionsticky.Binding{
+		ModelServer: selectedModelServer,
+		Pod:         ctx.BestPods[0].Pod.Name,
+	}
+	reqCtx := c.Request.Context()
+	if prevOK && !prev.Equal(selected) {
+		r.sessionStickyStore.Delete(reqCtx, stickyStoreKey)
+		klog.InfoS("session sticky: mapped binding no longer selectable, cleared",
+			"key", stickyStoreKey, "prev", prev.String(), "selected", selected.String())
+	}
+
+	ttl := sessionsticky.TTL(stickySpec)
+	if _, err := r.sessionStickyStore.Commit(reqCtx, stickyStoreKey, selected, ttl); err != nil {
+		klog.Errorf("session sticky commit: %v", err)
+	}
 }
 
 func ParseModelRequest(c *gin.Context) (ModelRequest, error) {
@@ -837,6 +939,7 @@ func (r *Router) proxy(
 	stream bool,
 	port int32,
 	timeout time.Duration,
+	rt http.RoundTripper,
 	onUsage func(u providers.TokenUsage),
 ) error {
 	// Capture body bytes once so each retry attempt gets a fresh reader.
@@ -867,7 +970,7 @@ func (r *Router) proxy(
 		}
 
 		// Request dispatched to the pod.
-		err := proxyRequest(c, req, podObj.Status.PodIP, port, stream, timeout, onUsage)
+		err := proxyRequest(c, req, podObj.Status.PodIP, utils.EndpointPort(podObj, port), stream, timeout, rt, onUsage)
 
 		if ctx.MetricsRecorder != nil {
 			ctx.MetricsRecorder.DecActiveUpstreamRequests()
@@ -911,14 +1014,26 @@ func (r *Router) proxyModelEndpoint(
 		}
 	}
 
+	// Resolve the per-ModelServer transport. May be nil (no connectionPool
+	// configured, or InferencePool/external path); callers fall back to the
+	// shared proxyTransport/upstreamTransport.
+	rt := r.transportFor(ctx.ModelServerName)
+	// Stash it for the PD-disaggregated connectors path; upstreamRoundTripper
+	// falls back to upstreamTransport when nil.
+	c.Set(common.UpstreamTransportKey, rt)
+
 	// proxy to pd aggregated pod
 	if ctx.BestPods != nil {
+		effRT := http.RoundTripper(proxyTransport)
+		if rt != nil {
+			effRT = rt
+		}
 		// build request
 		decodeRequest := connectors.BuildDecodeRequest(c, req, modelRequest)
 		stream := isStreaming(modelRequest)
 		modelName := ctx.Model
 		userID := c.GetString(common.UserIdKey)
-		err := r.proxy(c, decodeRequest, ctx, stream, port, timeout, func(usage providers.TokenUsage) {
+		err := r.proxy(c, decodeRequest, ctx, stream, port, timeout, effRT, func(usage providers.TokenUsage) {
 			if usage.TotalTokens <= 0 {
 				return
 			}
@@ -1129,9 +1244,10 @@ func proxyRequest(
 	port int32,
 	stream bool,
 	timeout time.Duration,
+	rt http.RoundTripper,
 	onUsage func(u providers.TokenUsage),
 ) error {
-	resp, err := doRequest(req, podIP, port, timeout)
+	resp, err := doRequest(req, podIP, port, timeout, rt)
 	if resp != nil {
 		defer resp.Body.Close()
 		accesslog.SetUpstreamInfo(c, resp.StatusCode, 0)
@@ -1309,6 +1425,7 @@ func doRequest(
 	podIP string,
 	port int32,
 	timeout time.Duration,
+	rt http.RoundTripper,
 ) (*http.Response, error) {
 	// step 1: change request URL to prefill pod URL.
 	req.URL.Host = net.JoinHostPort(podIP, strconv.Itoa(int(port)))
@@ -1325,7 +1442,7 @@ func doRequest(
 		req = req.WithContext(ctx)
 	}
 
-	resp, err := proxyTransport.RoundTrip(req)
+	resp, err := rt.RoundTrip(req)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -1410,8 +1527,8 @@ func (r *Router) proxyToPDDisaggregated(
 		accesslog.SetUpstreamInfo(c, 0, i+1)
 
 		// Build addresses for prefill and decode pods
-		prefillAddr := net.JoinHostPort(prefillPod.Status.PodIP, strconv.Itoa(int(port)))
-		decodeAddr := net.JoinHostPort(decodePod.Status.PodIP, strconv.Itoa(int(port)))
+		prefillAddr := net.JoinHostPort(prefillPod.Status.PodIP, strconv.Itoa(int(utils.EndpointPort(prefillPod, port))))
+		decodeAddr := net.JoinHostPort(decodePod.Status.PodIP, strconv.Itoa(int(utils.EndpointPort(decodePod, port))))
 
 		klog.V(4).Infof("Attempting PD disaggregated request: prefill=%s, decode=%s", prefillAddr, decodeAddr)
 

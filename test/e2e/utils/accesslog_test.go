@@ -30,6 +30,7 @@ func TestParseRouterAccessLogLine(t *testing.T) {
 		requestID        string
 		wantError        string
 		wantErrorMessage string
+		wantModelName    string
 	}{
 		{
 			name:      "text success",
@@ -42,6 +43,20 @@ func TestParseRouterAccessLogLine(t *testing.T) {
 			requestID:        "req-error",
 			wantError:        "upstream_response",
 			wantErrorMessage: "provider test/external-openai-chat returned HTTP 429",
+		},
+		{
+			name:             "text upstream error, quoted",
+			line:             `[2026-07-15T17:54:20Z] "POST /v1/chat/completions HTTP/1.1" 429 error="upstream_response:provider test/external-openai-chat returned HTTP 429" model_name=e2e-openai-chat model_route=test/external-openai-chat request_id=req-error backend_type=external_provider backend_name=test/external-openai-chat upstream_model=mock-openai-chat upstream_status_code=429 upstream_attempts=1 error_origin=upstream tokens=8/0 timings=2ms(0+2+0)`,
+			requestID:        "req-error",
+			wantError:        "upstream_response",
+			wantErrorMessage: "provider test/external-openai-chat returned HTTP 429",
+			wantModelName:    "e2e-openai-chat",
+		},
+		{
+			name:          "text quoted model name holding a space",
+			line:          `[2026-07-15T17:54:21Z] "POST /v1/chat/completions HTTP/1.1" 200 model_name="my model" request_id=req-space tokens=1/1 timings=1ms(0+1+0)`,
+			requestID:     "req-space",
+			wantModelName: "my model",
 		},
 		{
 			name:      "json",
@@ -62,6 +77,9 @@ func TestParseRouterAccessLogLine(t *testing.T) {
 				require.NotNil(t, entry.Error)
 				assert.Equal(t, tt.wantError, entry.Error.Type)
 				assert.Equal(t, tt.wantErrorMessage, entry.Error.Message)
+			}
+			if tt.wantModelName != "" {
+				assert.Equal(t, tt.wantModelName, entry.ModelName)
 			}
 			if tt.name == "text success" {
 				assert.Equal(t, 21, entry.InputTokens)

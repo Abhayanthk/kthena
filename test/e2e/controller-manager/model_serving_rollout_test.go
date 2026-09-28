@@ -234,6 +234,145 @@ func TestModelServingRollingUpdateMaxSurge(t *testing.T) {
 	assert.Equal(t, finalMS.Status.UpdateRevision, finalMS.Status.CurrentRevision)
 }
 
+// TestModelServingRollingUpdateMaxSurgeWithPartition verifies that maxSurge capacity
+// is added and removed without touching partition-protected ServingGroups.
+func TestModelServingRollingUpdateMaxSurgeWithPartition(t *testing.T) {
+	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+
+	const (
+		replicas  = int32(4)
+		partition = int32(2)
+	)
+
+	modelServing := createPartitionedModelServing("test-maxsurge-partition", replicas, partition)
+	modelServing.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxUnavailable = ptr.To(intstr.FromInt32(0))
+	modelServing.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxSurge = ptr.To(intstr.FromInt32(1))
+	createAndWaitForModelServing(t, ctx, kthenaClient, modelServing)
+
+	initial, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	initialRevision := initial.Status.CurrentRevision
+	require.NotEmpty(t, initialRevision)
+
+	selector := modelServingLabelSelector(modelServing.Name)
+	initialPods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	require.NoError(t, err)
+	protectedUIDs := make(map[string]string)
+	podsByName := make(map[string]*corev1.Pod, len(initialPods.Items))
+	for i := range initialPods.Items {
+		pod := initialPods.Items[i].DeepCopy()
+		podsByName[pod.Name] = pod
+		_, ordinal := controllerutils.GetParentNameAndOrdinal(pod.Labels[workload.GroupNameLabelKey])
+		if ordinal >= 0 && int32(ordinal) < partition {
+			protectedUIDs[pod.Name] = string(pod.UID)
+		}
+	}
+	require.Len(t, protectedUIDs, int(partition))
+
+	podWatcher, err := kubeClient.CoreV1().Pods(testNamespace).Watch(ctx, metav1.ListOptions{
+		LabelSelector:   selector,
+		ResourceVersion: initialPods.ResourceVersion,
+	})
+	require.NoError(t, err)
+	defer podWatcher.Stop()
+
+	updateModelServingWithRetry(t, ctx, kthenaClient, modelServing.Name, func(ms *workload.ModelServing) {
+		ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
+	})
+
+	surgeObserved := false
+	timer := time.NewTimer(2 * time.Minute)
+	defer timer.Stop()
+	for !surgeObserved {
+		select {
+		case <-timer.C:
+			require.FailNow(t, "expected maxSurge capacity while unprotected old ServingGroups remain")
+		case event, ok := <-podWatcher.ResultChan():
+			require.True(t, ok, "Pod watch closed before maxSurge capacity was observed")
+			require.NotEqual(t, watch.Error, event.Type, "Pod watch failed: %v", event.Object)
+			pod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				continue
+			}
+			if _, protected := protectedUIDs[pod.Name]; protected {
+				require.False(t, event.Type == watch.Deleted || pod.DeletionTimestamp != nil, "partition-protected Pod %s was deleted", pod.Name)
+			}
+			switch event.Type {
+			case watch.Added, watch.Modified:
+				podsByName[pod.Name] = pod.DeepCopy()
+			case watch.Deleted:
+				delete(podsByName, pod.Name)
+			default:
+				continue
+			}
+
+			liveGroups := make(map[string]bool)
+			hasUnprotectedOld, newRevisionReady := false, false
+			for _, currentPod := range podsByName {
+				if currentPod.DeletionTimestamp != nil || currentPod.Status.Phase == corev1.PodSucceeded || currentPod.Status.Phase == corev1.PodFailed {
+					continue
+				}
+				groupName := currentPod.Labels[workload.GroupNameLabelKey]
+				revision := currentPod.Labels[workload.RevisionLabelKey]
+				if groupName == "" || revision == "" || len(currentPod.Spec.Containers) == 0 {
+					continue
+				}
+				liveGroups[groupName] = true
+				_, ordinal := controllerutils.GetParentNameAndOrdinal(groupName)
+				if revision == initialRevision {
+					hasUnprotectedOld = hasUnprotectedOld || int32(ordinal) >= partition
+				} else if currentPod.Spec.Containers[0].Image == nginxAlpineImage && controllerutils.IsPodRunningAndReady(currentPod) {
+					newRevisionReady = true
+				}
+			}
+
+			require.LessOrEqual(t, len(liveGroups), int(replicas+1), "maxSurge capacity exceeded")
+			surgeObserved = len(liveGroups) == int(replicas+1) && hasUnprotectedOld && newRevisionReady
+		}
+	}
+
+	var finalMS *workload.ModelServing
+	require.Eventually(t, func() bool {
+		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+		if err != nil || ms.Status.UpdateRevision == "" || ms.Status.UpdateRevision == initialRevision {
+			return false
+		}
+		if ms.Status.Replicas != replicas ||
+			ms.Status.AvailableReplicas != replicas ||
+			ms.Status.UpdatedReplicas != replicas-partition {
+			t.Logf("Replicas: %d, AvailableReplicas: %d, UpdatedReplicas: %d (expecting %d, %d, %d)",
+				ms.Status.Replicas, ms.Status.AvailableReplicas, ms.Status.UpdatedReplicas, replicas, replicas, replicas-partition)
+			return false
+		}
+		ordinalStates, err := collectRunningServingGroupStates(ctx, kubeClient, modelServing.Name)
+		if err != nil {
+			t.Logf("Failed to collect serving group states: %v", err)
+			return false
+		}
+		if len(ordinalStates) != int(replicas) {
+			t.Logf("Running serving group count: %d (expecting %d)", len(ordinalStates), replicas)
+			return false
+		}
+		protectedCorrect, updatedCorrect := calculateGroupPartitionState(t, ordinalStates, partition, replicas, initialRevision, ms.Status.UpdateRevision)
+		if protectedCorrect != int(partition) || updatedCorrect != int(replicas-partition) {
+			t.Logf("Protected: %d/%d, Updated: %d/%d, states: %v", protectedCorrect, partition, updatedCorrect, replicas-partition, ordinalStates)
+			return false
+		}
+		finalMS = ms
+		return true
+	}, 3*time.Minute, 2*time.Second, "maxSurge rollout with partition did not converge")
+
+	assert.Equal(t, initialRevision, finalMS.Status.CurrentRevision)
+	assert.Equal(t, partition, finalMS.Status.CurrentReplicas)
+	for name, uid := range protectedUIDs {
+		pod, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, name, metav1.GetOptions{})
+		require.NoError(t, err, "partition-protected Pod %s should still exist", name)
+		assert.Equal(t, uid, string(pod.UID), "partition-protected Pod %s should not be recreated", name)
+	}
+}
+
 // TestModelServingRollingUpdateMaxUnavailableWithBadImage tests maxUnavailable constraint when transitioning to bad image
 func TestModelServingRollingUpdateMaxUnavailableWithBadImage(t *testing.T) {
 	ctx, kthenaClient, _ := setupControllerManagerE2ETest(t)
