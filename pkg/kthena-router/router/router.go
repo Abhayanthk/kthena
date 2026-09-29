@@ -634,21 +634,15 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		upstreamModelForMetrics = *modelServer.Spec.Model
 	}
 
-	// PD disaggregated models skip session sticky entirely.
 	var stickySpec *v1alpha1.SessionSticky
 	var sessionKey, stickyStoreKey string
 	var stickyBinding sessionsticky.Binding
 	var stickyBindingOK bool
-	stickyHint := ""
-	if pdGroup != nil {
-		if sessionStickyFromModelServer(modelServer) != nil {
-			klog.InfoS("session sticky bypassed for PD disaggregated model", "modelServer", klog.KObj(modelServer))
-		}
-	} else {
-		stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingOK = r.lookupSessionStickyBinding(c, modelServer)
-		if stickyBindingOK {
-			stickyHint = stickyBinding.Pod
-		}
+	stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingOK = r.lookupSessionStickyBinding(c, modelServer)
+	stickyBindingFound := stickyBindingOK
+	// PD sticky requires a complete Prefill/Decode binding; aggregated uses Pod only.
+	if stickyBindingOK && pdGroup != nil {
+		stickyBindingOK = stickyBinding.ValidPD()
 	}
 
 	ctx := &framework.Context{
@@ -659,7 +653,10 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		UpstreamModel:   upstreamModelForMetrics,
 		PDGroup:         pdGroup,
 		MetricsRecorder: metricsRecorder,
-		StickyPodName:   stickyHint,
+	}
+	if stickyBindingOK {
+		ctx.StickyPodName = stickyBinding.Pod
+		ctx.StickyPrefillPodName = stickyBinding.PrefillPod
 	}
 
 	err = r.scheduler.Schedule(ctx, pods)
@@ -668,8 +665,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		c.AbortWithStatusJSON(http.StatusBadRequest, fmt.Sprintf("can't schedule to target pod: %v", err))
 		return fmt.Errorf("can't schedule to target pod: %v", err)
 	}
-
-	r.finalizeSessionSticky(c, ctx, stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingOK, modelServerName.Name)
+	r.finalizeSessionSticky(c, ctx, stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingFound, modelServerName.Name)
 
 	// Set complete request routing information in access log
 	modelServerFullName := ""
@@ -779,13 +775,26 @@ func (r *Router) finalizeSessionSticky(
 	}
 
 	// ModelServer has no session sticky or scheduling did not pick a pod to bind.
-	if stickySpec == nil || selectedModelServer == "" || len(ctx.BestPods) == 0 || ctx.BestPods[0].Pod == nil {
+	if stickySpec == nil || selectedModelServer == "" {
 		return
 	}
-
-	selected := sessionsticky.Binding{
-		ModelServer: selectedModelServer,
-		Pod:         ctx.BestPods[0].Pod.Name,
+	selected := sessionsticky.Binding{ModelServer: selectedModelServer}
+	if ctx.PDGroup != nil {
+		if len(ctx.PrefillPods) == 0 || len(ctx.DecodePods) == 0 ||
+			ctx.PrefillPods[0] == nil || ctx.DecodePods[0] == nil {
+			klog.Warningf("session sticky: skip commit for PD modelServer %q: missing selectable prefill/decode pair after schedule (prefill=%d decode=%d)",
+				selectedModelServer, len(ctx.PrefillPods), len(ctx.DecodePods))
+			return
+		}
+		selected.PrefillPod = ctx.PrefillPods[0].GetPodNamespacedName().Name
+		selected.Pod = ctx.DecodePods[0].GetPodNamespacedName().Name
+	} else {
+		if len(ctx.BestPods) == 0 || ctx.BestPods[0].Pod == nil {
+			klog.Warningf("session sticky: skip commit for modelServer %q: no selectable pod after schedule",
+				selectedModelServer)
+			return
+		}
+		selected.Pod = ctx.BestPods[0].Pod.Name
 	}
 	reqCtx := c.Request.Context()
 	if prevOK && !prev.Equal(selected) {
