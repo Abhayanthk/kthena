@@ -186,7 +186,7 @@ func (optimizer *Optimizer) Optimize(ctx context.Context, podLister listerv1.Pod
 			continue
 		}
 		unreadyInstancesCount += currentUnreadyInstancesCount
-		readyInstancesMetrics = append(readyInstancesMetrics, currentReadyInstancesMetrics)
+		readyInstancesMetrics = append(readyInstancesMetrics, currentReadyInstancesMetrics...)
 		for metricName, metricValue := range currentExternalMetrics {
 			externalSamples[metricName] = append(externalSamples[metricName], backendExternalSample{
 				value:    metricValue,
