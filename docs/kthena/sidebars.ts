@@ -83,6 +83,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/tokenizer-service',
             'user-guide/fairness-scheduling',
             'user-guide/session-boost',
+            'user-guide/session-sticky',
             'user-guide/rate-limit',
             "user-guide/gateway-api-support",
             'user-guide/gateway-inference-extension-support',
