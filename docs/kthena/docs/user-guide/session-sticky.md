@@ -15,7 +15,7 @@ Omit `trafficPolicy.sessionSticky` when you want normal load balancing inside th
 1. `ModelRoute` selects a destination ModelServer.
 2. If that ModelServer has `sessionSticky`, the router evaluates `sources` in order and takes the first non-empty value as the session key. An empty key skips sticky for that request.
 3. The router looks up a binding keyed by ModelServer identity + session key.
-4. If a valid binding remains selectable, scheduling pins that Pod (or Prefill/Decode pair) and skips score plugins. Otherwise the stale binding is cleared and a new backend is chosen, then committed.
+4. If a valid binding remains selectable, scheduling pins that Pod (or Prefill/Decode pair); the pinned backend bypasses scoring. Otherwise the stale binding is cleared and a new backend is chosen, then committed.
 5. Each successful sticky schedule refreshes the TTL (sliding expiry).
 
 ## Configure ModelServer
@@ -101,7 +101,7 @@ Use Redis whenever you run more than one router replica and need cross-replica s
 Assume a `ModelRoute` targets `deepseek-r1-1-5b-sticky`, and sticky is configured with header `X-Session-ID` as above.
 
 ```bash
-# Same session key → same selected_pod in router access logs
+# Same session key → same backend (verify as below)
 curl -s http://$ROUTER_IP/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "X-Session-ID: conv-1" \
@@ -115,7 +115,12 @@ curl -s http://$ROUTER_IP/v1/chat/completions \
 
 Different session keys get independent bindings. Omitting the session key disables sticky for that request only; other requests for the ModelServer still stick when they present a key.
 
-Confirm stickiness via router access logs (`selected_pod`). After the bound Pod (or either side of a PD pair) becomes unselectable, the next request with the same key rebinds and the store is updated.
+Confirm stickiness as follows:
+
+- **Aggregated ModelServers**: compare `selected_pod` in router access logs across requests that share the session key.
+- **PD-disaggregated ModelServers**: `selected_pod` is empty because PD scheduling does not set `BestPods`. With `backend: redis`, inspect the binding (`pod` / `prefillPod` hash fields) for the mapping key; otherwise use higher-verbosity router logs.
+
+After the bound Pod (or either side of a PD pair) becomes unselectable, the next request with the same key rebinds and the store is updated.
 
 ## PD-disaggregated ModelServers
 
