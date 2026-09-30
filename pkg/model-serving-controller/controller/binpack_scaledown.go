@@ -111,7 +111,7 @@ func (c *ModelServingController) getPodDeletionCost(pod *corev1.Pod) int {
 			return cost
 		}
 	}
-	// The implicit deletion cost for pods that don't set the annotation is 0.
+	//  Default pod deletion cost when annotation is missing or invalid.
 	return 0
 }
 
@@ -124,10 +124,11 @@ func (c *ModelServingController) calculateRoleScore(ms *workloadv1alpha1.ModelSe
 	priority := getRoleStatusPriority(roleStatus)
 
 	// Get pod deletion cost as secondary factor
-	roleIDValue := fmt.Sprintf("%s/%s/%s/%s", ms.Namespace, groupName, roleName, roleID)
+	_, index := utils.GetParentNameAndOrdinal(roleID)
+	roleIDValue := ms.Namespace + "/" + groupName + "/" + roleName + "/" + roleID
 	pods, err := c.getPodsByIndex(RoleIDKey, roleIDValue)
 	if err != nil {
-		_, index := utils.GetParentNameAndOrdinal(roleID)
+		klog.Errorf("getPodsByIndex failed for %s/%s: %v", ms.Namespace, name, err)
 		return RoleWithScore{
 			Name:         roleID,
 			Priority:     priority,
@@ -141,8 +142,6 @@ func (c *ModelServingController) calculateRoleScore(ms *workloadv1alpha1.ModelSe
 	for _, pod := range pods {
 		deletionCost += c.getPodDeletionCost(pod)
 	}
-
-	_, index := utils.GetParentNameAndOrdinal(roleID)
 
 	return RoleWithScore{
 		Name:         roleID,
