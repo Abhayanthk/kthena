@@ -270,8 +270,11 @@ func (collector *MetricCollector) collectPodMetricsGroup(
 			continue
 		}
 		podValues := make(algorithm.Metrics, len(specs))
-		if err = collector.collectPodMetrics(ctx, pod, podSource, wanted, podValues, pastHistograms, currentHistograms); err != nil {
-			return nil, nil, false, err
+		if scrapeErr := collector.collectPodMetrics(ctx, pod, podSource, wanted, podValues, pastHistograms, currentHistograms); scrapeErr != nil {
+			// Keep the ready pod as an entry with no values so the algorithm counts
+			// its metrics as missing, instead of dropping it or treating it as zero load.
+			klog.Warningf("collect metrics from pod %s failed: %v", metricPodKey(pod), scrapeErr)
+			podValues = make(algorithm.Metrics)
 		}
 		values[metricPodKey(pod)] = podValues
 	}
