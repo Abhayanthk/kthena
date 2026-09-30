@@ -24,6 +24,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -128,7 +129,7 @@ func (c *ModelServingController) calculateRoleScore(ms *workloadv1alpha1.ModelSe
 	roleIDValue := ms.Namespace + "/" + groupName + "/" + roleName + "/" + roleID
 	pods, err := c.getPodsByIndex(RoleIDKey, roleIDValue)
 	if err != nil {
-		klog.Errorf("getPodsByIndex failed for %s/%s: %v", ms.Namespace, name, err)
+		klog.Errorf("getPodsByIndex failed for %s/%s: %v", ms.Namespace, ms.Name, err)
 		return RoleWithScore{
 			Name:         roleID,
 			Priority:     priority,
