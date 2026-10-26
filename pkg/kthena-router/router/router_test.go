@@ -3929,6 +3929,162 @@ func TestRouter_ProxyToPDDisaggregated_RetryBehavior(t *testing.T) {
 	}
 }
 
+// spyScheduler counts RunPostHooks calls, so a test can tell whether the
+// prefix cache was updated before a request reached its backend.
+type spyScheduler struct {
+	postHookCalls atomic.Int32
+}
+
+func (s *spyScheduler) Schedule(*framework.Context, []*datastore.PodInfo) error { return nil }
+
+func (s *spyScheduler) RunPostHooks(*framework.Context, int) { s.postHookCalls.Add(1) }
+
+// TestRouter_Proxy_RunsPostHooksBeforeProxying checks that the prefix cache
+// records the chosen pod before the request is proxied, not after the response,
+// so requests with the same prefix that arrive while this one is still streaming
+// can find the pod. The backend records how many post hooks had run when each
+// attempt reached it.
+func TestRouter_Proxy_RunsPostHooksBeforeProxying(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name      string
+		failFirst bool
+		wantSeen  []int32
+	}{
+		{
+			name:     "records the pod before the request reaches it",
+			wantSeen: []int32{1},
+		},
+		{
+			name:      "records each attempted pod, including one that fails",
+			failFirst: true,
+			wantSeen:  []int32{1, 2},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spy := &spyScheduler{}
+			seen := make(chan int32, 2)
+			var attempts atomic.Int32
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen <- spy.postHookCalls.Load()
+				if tt.failFirst && attempts.Add(1) == 1 {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, `{"id":"ok"}`)
+			}))
+			defer backend.Close()
+
+			host, port := splitHostPort(t, backend.URL)
+			pod1 := &corev1.Pod{
+				ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
+				Status:     corev1.PodStatus{PodIP: host},
+			}
+			pod2 := &corev1.Pod{
+				ObjectMeta: v1.ObjectMeta{Name: "pod-2", Namespace: "default"},
+				Status:     corev1.PodStatus{PodIP: host},
+			}
+
+			store := datastore.New()
+			router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
+			router.scheduler = spy
+
+			ctx := &framework.Context{
+				Model:    "test-model",
+				BestPods: []*datastore.PodInfo{{Pod: pod1}, {Pod: pod2}},
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			req, err := http.NewRequest(http.MethodPost, backend.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+			require.NoError(t, err)
+			c.Request = req
+
+			err = router.proxy(c, req, ctx, false, port, 2*time.Second, proxyTransport, nil)
+			require.NoError(t, err)
+
+			close(seen)
+			var got []int32
+			for n := range seen {
+				got = append(got, n)
+			}
+			assert.Equal(t, tt.wantSeen, got, "post hooks must run before each attempt is proxied")
+		})
+	}
+}
+
+// TestRouter_ProxyToPDDisaggregated_RunsPostHooksBeforeProxying is the
+// prefill/decode version: the pair must be recorded before the KV connector
+// starts prefill, not after decode has finished streaming.
+func TestRouter_ProxyToPDDisaggregated_RunsPostHooksBeforeProxying(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	pod1 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.1"},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-2", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.2"},
+	}
+	info1 := &datastore.PodInfo{Pod: pod1}
+	info2 := &datastore.PodInfo{Pod: pod2}
+
+	tests := []struct {
+		name      string
+		failFirst bool
+		wantSeen  []int32
+	}{
+		{
+			name:     "records the pair before the connector runs",
+			wantSeen: []int32{1},
+		},
+		{
+			name:      "records each attempted pair, including one that fails",
+			failFirst: true,
+			wantSeen:  []int32{1, 2},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := datastore.New()
+			router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
+			spy := &spyScheduler{}
+			router.scheduler = spy
+
+			ctx := &framework.Context{
+				Model:       "test-model",
+				PrefillPods: []*datastore.PodInfo{info1, info2},
+				DecodePods:  []*datastore.PodInfo{info1, info2},
+			}
+
+			var seen []int32
+			mockConnector := &mockKVConnector{}
+			mockConnector.proxyHandler = func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+				seen = append(seen, spy.postHookCalls.Load())
+				if tt.failFirst && mockConnector.calls.Load() == 1 {
+					return 0, fmt.Errorf("prefill connection refused")
+				}
+				c.Writer.WriteHeader(http.StatusOK)
+				return 1, nil
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"test-model"}`))
+
+			err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "test-model"}, 8000, 2*time.Second)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantSeen, seen, "post hooks must run before each attempt is proxied")
+		})
+	}
+}
+
 // TestRouter_ProxyToPDDisaggregated_DecodeUpstreamError covers the review concern that a
 // non-2xx Responses upstream response, if written to c.Writer immediately, would make
 // c.Writer.Written() true and stop the retry loop above from trying another prefill/decode

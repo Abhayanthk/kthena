@@ -985,6 +985,11 @@ func (r *Router) proxy(
 		// Track this request as in-flight to the chosen pod.
 		r.store.IncrPodOnFlightRequests(podName)
 
+		// Record the prefix before proxying, not after the response, so requests
+		// with the same prefix that arrive while this one streams can find this pod.
+		// A failed attempt may leave a stale entry; the prefix cache is approximate.
+		r.scheduler.RunPostHooks(ctx, i)
+
 		if ctx.MetricsRecorder != nil {
 			ctx.MetricsRecorder.IncActiveUpstreamRequests()
 		}
@@ -1006,8 +1011,6 @@ func (r *Router) proxy(
 			}
 			continue
 		}
-		// record in prefix cache
-		r.scheduler.RunPostHooks(ctx, i)
 		return nil
 	}
 	c.AbortWithStatusJSON(http.StatusServiceUnavailable, "request to all pods failed")
@@ -1565,6 +1568,11 @@ func (r *Router) proxyToPDDisaggregated(
 			DecrDecode:  func() { r.store.DecrPodOnFlightRequests(decodePodName) },
 		}
 
+		// Record the prefix for both pods before proxying, not after the response,
+		// so requests with the same prefix that arrive while this one runs can find them.
+		// A failed attempt may leave a stale entry; the prefix cache is approximate.
+		r.scheduler.RunPostHooks(ctx, i)
+
 		// Execute the PD disaggregated proxy operation
 		outputTokens, err := kvConnector.Proxy(c, modelRequest, prefillAddr, decodeAddr, timeout, hooks)
 		if c.Writer.Written() {
@@ -1597,9 +1605,6 @@ func (r *Router) proxyToPDDisaggregated(
 		if metricsRecorder != nil {
 			metricsRecorder.RecordOutputTokens(outputTokens)
 		}
-
-		// Record successful operation in cache
-		r.scheduler.RunPostHooks(ctx, i)
 
 		klog.V(4).Infof("kv connector run successful for prefill pod %s, decode pod %s, output tokens: %d",
 			prefillPod.Name, decodePod.Name, outputTokens)
