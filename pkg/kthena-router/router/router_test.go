@@ -3930,7 +3930,7 @@ func TestRouter_ProxyToPDDisaggregated_RetryBehavior(t *testing.T) {
 }
 
 // spyScheduler counts RunPostHooks calls, so a test can tell whether the
-// prefix cache was updated before a request reached its backend.
+// post hooks ran before a request reached its backend.
 type spyScheduler struct {
 	postHookCalls atomic.Int32
 }
@@ -3939,11 +3939,10 @@ func (s *spyScheduler) Schedule(*framework.Context, []*datastore.PodInfo) error 
 
 func (s *spyScheduler) RunPostHooks(*framework.Context, int) { s.postHookCalls.Add(1) }
 
-// TestRouter_Proxy_RunsPostHooksBeforeProxying checks that the prefix cache
-// records the chosen pod before the request is proxied, not after the response,
-// so requests with the same prefix that arrive while this one is still streaming
-// can find the pod. The backend records how many post hooks had run when each
-// attempt reached it.
+// TestRouter_Proxy_RunsPostHooksBeforeProxying checks that the post hooks, which
+// the prefix cache uses to record the chosen pod, run before the request is
+// proxied, not after the response. The backend records how many post hooks had
+// run when each attempt reached it.
 func TestRouter_Proxy_RunsPostHooksBeforeProxying(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -4018,7 +4017,7 @@ func TestRouter_Proxy_RunsPostHooksBeforeProxying(t *testing.T) {
 }
 
 // TestRouter_ProxyToPDDisaggregated_RunsPostHooksBeforeProxying is the
-// prefill/decode version: the pair must be recorded before the KV connector
+// prefill/decode version: the post hooks must run before the KV connector
 // starts prefill, not after decode has finished streaming.
 func TestRouter_ProxyToPDDisaggregated_RunsPostHooksBeforeProxying(t *testing.T) {
 	gin.SetMode(gin.TestMode)

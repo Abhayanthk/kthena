@@ -985,9 +985,10 @@ func (r *Router) proxy(
 		// Track this request as in-flight to the chosen pod.
 		r.store.IncrPodOnFlightRequests(podName)
 
-		// Record the prefix before proxying, not after the response, so requests
-		// with the same prefix that arrive while this one streams can find this pod.
-		// A failed attempt may leave a stale entry; the prefix cache is approximate.
+		// Run the post hooks before proxying, not after the response. The prefix
+		// cache uses them to record this pod for the prompt's prefix, so requests
+		// with the same prefix that arrive while this one is running can be routed
+		// to this pod. The entry is kept even if the attempt fails.
 		r.scheduler.RunPostHooks(ctx, i)
 
 		if ctx.MetricsRecorder != nil {
@@ -1568,9 +1569,11 @@ func (r *Router) proxyToPDDisaggregated(
 			DecrDecode:  func() { r.store.DecrPodOnFlightRequests(decodePodName) },
 		}
 
-		// Record the prefix for both pods before proxying, not after the response,
-		// so requests with the same prefix that arrive while this one runs can find them.
-		// A failed attempt may leave a stale entry; the prefix cache is approximate.
+		// Run the post hooks before proxying, not after the response. The prefix
+		// cache uses them to record both the prefill and the decode pod for the
+		// prompt's prefix, so requests with the same prefix that arrive while this
+		// one is running can be routed to them. The entries are kept even if the
+		// attempt fails.
 		r.scheduler.RunPostHooks(ctx, i)
 
 		// Execute the PD disaggregated proxy operation
