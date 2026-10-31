@@ -1,0 +1,60 @@
+package datastore
+
+import (
+	"net/http"
+	"net/url"
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+)
+
+func u32(v uint32) *uint32 { return &v }
+
+// Zero-weight rule in the older route shadows a valid newer route.
+func TestExtra_ZeroWeightRouteShadowsFallthrough(t *testing.T) {
+	s := New().(*store)
+	older := &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "a-zero", CreationTimestamp: metav1.Unix(100, 0)},
+		Spec: aiv1alpha1.ModelRouteSpec{ModelName: "m", Rules: []*aiv1alpha1.Rule{{
+			TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "drained", Weight: u32(0)}},
+		}}},
+	}
+	newer := &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "b-ok", CreationTimestamp: metav1.Unix(200, 0)},
+		Spec: aiv1alpha1.ModelRouteSpec{ModelName: "m", Rules: []*aiv1alpha1.Rule{{
+			TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "live", Weight: u32(100)}},
+		}}},
+	}
+	_ = s.AddOrUpdateModelRoute(older)
+	_ = s.AddOrUpdateModelRoute(newer)
+	req := &http.Request{Header: http.Header{}, URL: &url.URL{Path: "/v1/chat/completions"}}
+	_, _, _, _, err := s.MatchModelTarget("m", req, "")
+	if err == nil {
+		t.Fatalf("expected the bug: zero-weight route should shadow the valid route, but match succeeded")
+	}
+	t.Logf("reproduced: MatchModelTarget error = %v (valid route b-ok never tried)", err)
+}
+
+// A nil StringMatch in rule.ModelMatch.Headers panics in matchString.
+func TestExtra_NilHeaderMatcherPanics(t *testing.T) {
+	s := New().(*store)
+	mr := &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "r"},
+		Spec: aiv1alpha1.ModelRouteSpec{ModelName: "m", Rules: []*aiv1alpha1.Rule{{
+			ModelMatch:   &aiv1alpha1.ModelMatch{Headers: map[string]*aiv1alpha1.StringMatch{"x-tenant": nil}},
+			TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms"}},
+		}}},
+	}
+	_ = s.AddOrUpdateModelRoute(mr)
+	req := &http.Request{Header: http.Header{}, URL: &url.URL{Path: "/v1/chat/completions"}}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Logf("reproduced: panic = %v", r)
+			return
+		}
+		t.Fatalf("expected a nil-deref panic")
+	}()
+	_, _, _, _, _ = s.MatchModelTarget("m", req, "")
+}

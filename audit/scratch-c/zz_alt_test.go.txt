@@ -1,0 +1,537 @@
+package datastore
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"runtime"
+	"strconv"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+)
+
+func altPod(ns, name, ip string, lbls map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, Labels: lbls},
+		Status:     corev1.PodStatus{PodIP: ip, Phase: corev1.PodRunning},
+	}
+}
+
+func altCountAdmitted(reqs []*Request) int {
+	n := 0
+	for _, r := range reqs {
+		if isClosed(r.NotifyChan) {
+			n++
+		}
+	}
+	return n
+}
+
+// 1. Session-boost capacity is resolved by the *requested* model name against
+// the names scraped from /v1/models, not via ModelRoute -> ModelServer -> pods.
+func TestAlt_AliasedModelDisablesSessionBoostBackpressure(t *testing.T) {
+	cfg := DefaultFairnessQueueConfig()
+	cfg.SessionBoostEnabled = true
+	cfg.InflightPerPod = 2
+	s := &store{fairnessQueueConfig: cfg, tokenTracker: NewInMemorySlidingWindowTokenTracker()}
+	const alias = "deepseek-simple"                           // ModelRoute.spec.modelName (examples/kthena-router/ModelRouteSimple.yaml)
+	const served = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" // ModelServer.spec.model, what vLLM lists in /v1/models
+	ms := types.NamespacedName{Namespace: "default", Name: "deepseek-r1-1-5b"}
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprintf("p%d", i)
+		s.pods.Store(types.NamespacedName{Namespace: "default", Name: name}, &PodInfo{
+			Pod: altPod("default", name, "10.0.0.1", nil), engine: "vLLM",
+			modelServer: sets.New(ms), models: sets.New(served), RequestWaitingNum: 10,
+		})
+	}
+	assert.False(t, s.makeBackendWaitingChecker(served)(), "served name: all 4 pods busy")
+	assert.Equal(t, 4, s.makeBackendPodCounter(served)())
+	assert.True(t, s.makeBackendWaitingChecker(alias)(), "alias: same busy pods invisible -> 'capacity'")
+	assert.Equal(t, 0, s.makeBackendPodCounter(alias)(), "alias: pod count 0 -> limit not scaled")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.rootCtx = ctx
+	mk := func(model string) []*Request {
+		var reqs []*Request
+		for i := 0; i < 20; i++ {
+			r := &Request{UserID: "u", ModelName: model, RequestTime: time.Now(), NotifyChan: make(chan struct{})}
+			reqs = append(reqs, r)
+			assert.NoError(t, s.Enqueue(r))
+		}
+		return reqs
+	}
+	aliasReqs := mk(alias)
+	servedReqs := mk(served)
+	time.Sleep(300 * time.Millisecond)
+	t.Logf("alias queue admitted=%d (pods all busy; documented limit 4*2=8)", altCountAdmitted(aliasReqs))
+	t.Logf("served-name queue admitted=%d", altCountAdmitted(servedReqs))
+	assert.Equal(t, 2, altCountAdmitted(aliasReqs))
+	assert.Equal(t, 0, altCountAdmitted(servedReqs))
+}
+
+// 1b. Same model name served by an unrelated ModelServer (other namespace/tenant):
+// one idle pod there opens the gate for the shared, name-keyed queue.
+func TestAlt_IdlePodOfOtherModelServerOpensGate(t *testing.T) {
+	cfg := DefaultFairnessQueueConfig()
+	cfg.SessionBoostEnabled = true
+	s := &store{fairnessQueueConfig: cfg}
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("a%d", i)
+		s.pods.Store(types.NamespacedName{Namespace: "team-a", Name: name}, &PodInfo{
+			Pod: altPod("team-a", name, "10.0.0.1", nil), engine: "vLLM",
+			modelServer: sets.New(types.NamespacedName{Namespace: "team-a", Name: "llama"}), models: sets.New("llama"), RequestWaitingNum: 25,
+		})
+	}
+	s.pods.Store(types.NamespacedName{Namespace: "team-b", Name: "b0"}, &PodInfo{
+		Pod: altPod("team-b", "b0", "10.0.1.1", nil), engine: "vLLM",
+		modelServer: sets.New(types.NamespacedName{Namespace: "team-b", Name: "llama"}), models: sets.New("llama"), RequestWaitingNum: 0,
+	})
+	assert.True(t, s.makeBackendWaitingChecker("llama")(), "team-b's idle pod admits team-a's requests to saturated pods")
+	assert.Equal(t, 4, s.makeBackendPodCounter("llama")())
+}
+
+// 2. AddOrUpdateModelServer replaces ms.pods without reconciling PodInfo.modelServer:
+// a static-endpoints ModelServer switched to a workloadSelector leaves its synthetic pod
+// in s.pods forever (DeleteModelServer only walks ms.pods).
+func TestAlt_EndpointsToSelectorLeavesZombiePodInfo(t *testing.T) {
+	s := newStore(&fakePodRuntimeInspector{})
+	ms := &aiv1alpha1.ModelServer{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ms"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			InferenceEngine: aiv1alpha1.VLLM,
+			WorkloadPort:    aiv1alpha1.WorkloadPort{Port: 8000},
+			Endpoints:       []aiv1alpha1.Endpoint{{Name: "e1", Address: "10.1.1.1"}},
+		},
+	}
+	msName := utils.GetNamespaceName(ms)
+	ep := utils.EndpointPod(ms, ms.Spec.Endpoints[0])
+	epName := utils.GetNamespaceName(ep)
+	// SyncStaticEndpoints
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, sets.New(epName)))
+	assert.NoError(t, s.AddOrUpdatePod(ep, []*aiv1alpha1.ModelServer{ms}))
+
+	// User drops spec.endpoints and adds a selector; syncModelServerHandler's selector path:
+	ms2 := ms.DeepCopy()
+	ms2.Spec.Endpoints = nil
+	ms2.Spec.WorkloadSelector = &aiv1alpha1.WorkloadSelector{MatchLabels: map[string]string{"app": "llm"}}
+	p1 := altPod("default", "p1", "10.0.0.1", map[string]string{"app": "llm"})
+	p1Name := utils.GetNamespaceName(p1)
+	assert.NoError(t, s.AddOrUpdateModelServer(ms2, sets.New(p1Name)))
+	assert.NoError(t, s.AddOrUpdatePod(p1, []*aiv1alpha1.ModelServer{ms2}))
+
+	pods, _ := s.GetPodsByModelServer(msName)
+	assert.Len(t, pods, 1)
+	assert.NotNil(t, s.GetPodInfo(epName), "synthetic endpoint still in s.pods (scraped every interval)")
+	assert.True(t, s.GetPodInfo(epName).HasModelServer(msName), "dangling reverse membership")
+
+	assert.NoError(t, s.DeleteModelServer(msName))
+	assert.Nil(t, s.GetPodInfo(p1Name))
+	assert.NotNil(t, s.GetPodInfo(epName), "synthetic endpoint survives its ModelServer's deletion")
+	t.Logf("pods left after DeleteModelServer: %v", len(s.GetAllPods()))
+}
+
+// 3. PD indexes are rebuilt only on selector change; a pod dropped from ms.pods for
+// any other reason stays a PD decode target.
+func TestAlt_PDIndexKeepsPodDroppedFromPodSet(t *testing.T) {
+	s := newStore(&fakePodRuntimeInspector{})
+	ms := &aiv1alpha1.ModelServer{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pd", ResourceVersion: "1"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			InferenceEngine: aiv1alpha1.VLLM,
+			WorkloadPort:    aiv1alpha1.WorkloadPort{Port: 8000},
+			WorkloadSelector: &aiv1alpha1.WorkloadSelector{
+				MatchLabels: map[string]string{"app": "llm"},
+				PDGroup: &aiv1alpha1.PDGroup{
+					GroupKey:      "group",
+					DecodeLabels:  map[string]string{"role": "decode"},
+					PrefillLabels: map[string]string{"role": "prefill"},
+				},
+			},
+		},
+	}
+	msName := utils.GetNamespaceName(ms)
+	d1 := altPod("default", "d1", "10.0.0.1", map[string]string{"app": "llm", "role": "decode", "group": "g1"})
+	d2 := altPod("default", "d2", "10.0.0.3", map[string]string{"app": "llm", "role": "decode", "group": "g1"})
+	p1 := altPod("default", "p1", "10.0.0.2", map[string]string{"app": "llm", "role": "prefill", "group": "g1"})
+	d1n, d2n, p1n := utils.GetNamespaceName(d1), utils.GetNamespaceName(d2), utils.GetNamespaceName(p1)
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, sets.New(d1n, d2n, p1n)))
+	for _, p := range []*corev1.Pod{d1, d2, p1} {
+		assert.NoError(t, s.AddOrUpdatePod(p, []*aiv1alpha1.ModelServer{ms}))
+	}
+	// d1 relabeled out of rotation (app=llm-debug). syncPodHandler -> addOrUpdatePod finds no
+	// matching ModelServer and makes no store call. Later, any ModelServer update re-syncs it
+	// with the ready pods listed by the unchanged selector:
+	ms2 := ms.DeepCopy()
+	ms2.ResourceVersion = "2"
+	assert.NoError(t, s.AddOrUpdateModelServer(ms2, sets.New(d2n, p1n)))
+
+	pods, _ := s.GetPodsByModelServer(msName)
+	decode, _ := s.GetDecodePods(msName)
+	var podNames, decodeNames []string
+	for _, p := range pods {
+		podNames = append(podNames, p.GetPodNamespacedName().Name)
+	}
+	for _, p := range decode {
+		decodeNames = append(decodeNames, p.GetPodNamespacedName().Name)
+	}
+	t.Logf("ms.pods=%v decode index=%v", podNames, decodeNames)
+	assert.NotContains(t, podNames, "d1")
+	assert.Contains(t, decodeNames, "d1", "PD scheduling still targets the pod removed from ms.pods")
+	prefills, err := s.GetPrefillPodsForDecodeGroup(msName, d1n)
+	assert.NoError(t, err)
+	assert.Len(t, prefills, 1)
+
+	assert.NoError(t, s.DeleteModelServer(msName))
+	assert.NotNil(t, s.GetPodInfo(d1n), "d1 also survives DeleteModelServer")
+}
+
+// 4. Queue lifecycle split: created by Enqueue (request path, no route check),
+// destroyed by ModelRoute handlers. HasModel->Enqueue TOCTOU leaks a queue+goroutine.
+func TestAlt_EnqueueAfterRouteDeleteLeaksQueue(t *testing.T) {
+	s := newStore(&fakePodRuntimeInspector{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.rootCtx = ctx
+	mr := &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "r"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "m",
+			Rules:     []*aiv1alpha1.Rule{{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms"}}}},
+		},
+	}
+	assert.NoError(t, s.AddOrUpdateModelRoute(mr))
+	assert.True(t, s.HasModel("m")) // router.go:314, before tokenization and rate limiting
+	assert.NoError(t, s.DeleteModelRoute("default/r"))
+	before := runtime.NumGoroutine()
+	req := &Request{UserID: "u", ModelName: "m", RequestTime: time.Now(), NotifyChan: make(chan struct{})}
+	assert.NoError(t, s.Enqueue(req)) // router.go:1707
+	time.Sleep(50 * time.Millisecond)
+	_, ok := s.requestWaitingQueue.Load("m")
+	assert.True(t, ok, "orphan queue for a model with no route")
+	assert.False(t, s.HasModel("m"))
+	t.Logf("goroutines before=%d after=%d", before, runtime.NumGoroutine())
+}
+
+// 4b. DeleteModelRoute closes queues without the "still routed as base or LoRA"
+// filter that AddOrUpdateModelRoute applies.
+func TestAlt_DeleteModelRouteClosesStillRoutedQueue(t *testing.T) {
+	s := newStore(&fakePodRuntimeInspector{})
+	s.fairnessQueueConfig.MaxConcurrent = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.rootCtx = ctx
+	rule := []*aiv1alpha1.Rule{{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms"}}}}
+	a := &aiv1alpha1.ModelRoute{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "a"},
+		Spec: aiv1alpha1.ModelRouteSpec{ModelName: "qwen-sql", Rules: rule}}
+	b := &aiv1alpha1.ModelRoute{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "b"},
+		Spec: aiv1alpha1.ModelRouteSpec{ModelName: "qwen", LoraAdapters: []string{"qwen-sql"}, Rules: rule}}
+	assert.NoError(t, s.AddOrUpdateModelRoute(a))
+	assert.NoError(t, s.AddOrUpdateModelRoute(b))
+
+	holder := &Request{UserID: "u", ModelName: "qwen-sql", RequestTime: time.Now(), NotifyChan: make(chan struct{})}
+	assert.NoError(t, s.Enqueue(holder))
+	assert.Eventually(t, func() bool { return isClosed(holder.NotifyChan) }, time.Second, 5*time.Millisecond)
+	var cancelled atomic.Bool
+	waiter := &Request{UserID: "u", ModelName: "qwen-sql", RequestTime: time.Now(), NotifyChan: make(chan struct{}),
+		Cancel: func() { cancelled.Store(true) }}
+	assert.NoError(t, s.Enqueue(waiter))
+
+	assert.NoError(t, s.DeleteModelRoute("default/a"))
+	assert.True(t, s.HasModel("qwen-sql"), "still routable through route b's LoRA adapter")
+	assert.True(t, cancelled.Load(), "queued request was cancelled although the model is still routed")
+}
+
+// 5. Missing gauge encoded as zero: a successful scrape lacking a gauge zeroes it.
+func TestAlt_MissingGaugeBecomesZero(t *testing.T) {
+	var full atomic.Bool
+	full.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if full.Load() {
+			fmt.Fprint(w, "# TYPE vllm:num_requests_waiting gauge\nvllm:num_requests_waiting{model_name=\"m\"} 10\n"+
+				"# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running{model_name=\"m\"} 8\n"+
+				"# TYPE vllm:kv_cache_usage_perc gauge\nvllm:kv_cache_usage_perc{model_name=\"m\"} 0.95\n")
+			return
+		}
+		// e.g. engine started with stats disabled, or a renamed metric: 200 OK, no vllm:* gauges.
+		fmt.Fprint(w, "# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total 12\n")
+	}))
+	defer srv.Close()
+	_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	s := New().(*store) // real inspector
+	pod := altPod("default", "p", "127.0.0.1", nil)
+	pod.Annotations = map[string]string{utils.EndpointPortAnnotation: strconv.Itoa(port)}
+	pi := &PodInfo{Pod: pod, engine: "vLLM", models: sets.New("m"), TPOT: 0.05, TTFT: 0.3}
+
+	assert.True(t, s.updatePodMetrics(pi))
+	assert.Equal(t, 10.0, pi.GetRequestWaitingNum())
+	assert.Equal(t, 0.95, pi.GetGPUCacheUsage())
+	full.Store(false)
+	ok := s.updatePodMetrics(pi)
+	t.Logf("refresh reported success=%v waiting=%v running=%v kv=%v tpot=%v ttft=%v",
+		ok, pi.GetRequestWaitingNum(), pi.GetRequestRunningNum(), pi.GetGPUCacheUsage(), pi.GetTPOT(), pi.GetTTFT())
+	assert.True(t, ok, "counted as a successful refresh (fires a session-boost recheck)")
+	assert.Equal(t, 0.0, pi.GetRequestWaitingNum(), "missing gauge stored as 0 = 'idle'")
+	assert.Equal(t, 0.0, pi.GetGPUCacheUsage())
+	assert.Equal(t, 0.05, pi.GetTPOT(), "TPOT/TTFT special-cased: kept")
+}
+
+// 6. tryBackpressureDequeue checks capacity and then calls the *blocking*
+// popWhenAvailable; if only cancelled requests remain it blocks, and the next
+// arrival is admitted on the stale capacity decision.
+func TestAlt_BlockedPopAdmitsPastBusyBackend(t *testing.T) {
+	cfg := DefaultFairnessQueueConfig()
+	cfg.SessionBoostEnabled = true
+	var busy atomic.Bool
+	busy.Store(true)
+	q := NewRequestPriorityQueueWithConfig(nil, cfg, nil, func() bool { return !busy.Load() })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer q.Close()
+	go q.Run(ctx, 0)
+
+	// Control: with the backend busy a fresh arrival is held.
+	ctlCancel := make(chan struct{})
+	ctl := &Request{UserID: "u", ModelName: "m", RequestTime: time.Now(), NotifyChan: make(chan struct{}), CancelCh: ctlCancel}
+	assert.NoError(t, q.PushRequest(ctl))
+	time.Sleep(50 * time.Millisecond)
+	assert.False(t, isClosed(ctl.NotifyChan))
+
+	close(ctlCancel)
+	busy.Store(false)
+	q.RecheckBackpressure() // scrape refresh: loop pops the cancelled head and blocks in popWhenAvailable
+	time.Sleep(50 * time.Millisecond)
+	busy.Store(true) // next scrape: backend busy again
+
+	r2 := &Request{UserID: "u", ModelName: "m", RequestTime: time.Now(), NotifyChan: make(chan struct{})}
+	assert.NoError(t, q.PushRequest(r2))
+	time.Sleep(50 * time.Millisecond)
+	t.Logf("r2 admitted while backend busy: %v", isClosed(r2.NotifyChan))
+	r3 := &Request{UserID: "u", ModelName: "m", RequestTime: time.Now(), NotifyChan: make(chan struct{})}
+	assert.NoError(t, q.PushRequest(r3))
+	time.Sleep(50 * time.Millisecond)
+	t.Logf("r3 admitted while backend busy: %v", isClosed(r3.NotifyChan))
+	assert.False(t, isClosed(r2.NotifyChan), "r2 must be held while the backend is busy")
+}
+
+// 7. Per-pod global broadcast recheck: every successful pod scrape wakes every held
+// queue and each wake re-scans every pod (and logs at INFO when busy).
+func TestAlt_RecheckAmplification(t *testing.T) {
+	const n = 60
+	insp := &fakePodRuntimeInspector{
+		metricsFn: func(string, *corev1.Pod, uint32, map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+			time.Sleep(time.Duration(rand.Intn(80)) * time.Millisecond)
+			return map[string]float64{utils.RequestWaitingNum: 5}, nil
+		},
+		modelsFn: func(string, *corev1.Pod, uint32) ([]string, error) {
+			time.Sleep(time.Duration(rand.Intn(80)) * time.Millisecond)
+			return []string{"llama"}, nil
+		},
+	}
+	s := newStore(insp)
+	s.fairnessQueueConfig = newSessionBoostStoreConfig()
+	s.metricsScrapeInterval = 500 * time.Millisecond
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("p%d", i)
+		s.pods.Store(types.NamespacedName{Namespace: "default", Name: name}, &PodInfo{
+			Pod: altPod("default", name, "10.0.0.1", nil), engine: "vLLM",
+			modelServer: sets.New(types.NamespacedName{Namespace: "default", Name: "ms"}), models: sets.New("llama"), RequestWaitingNum: 5,
+		})
+	}
+	var checks atomic.Int64
+	inner := s.makeBackendWaitingChecker("llama")
+	q := NewRequestPriorityQueueWithConfig(nil, s.fairnessQueueConfig, nil, func() bool { checks.Add(1); return inner() })
+	q.podCounter = s.makeBackendPodCounter("llama")
+	defer q.Close()
+	s.requestWaitingQueue.Store("llama", q)
+	// A second held queue for an unrelated model is woken by the same pods.
+	var otherChecks atomic.Int64
+	q2 := NewRequestPriorityQueueWithConfig(nil, s.fairnessQueueConfig, nil, func() bool { otherChecks.Add(1); return false })
+	defer q2.Close()
+	s.requestWaitingQueue.Store("unrelated", q2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go q.Run(ctx, 0)
+	go q2.Run(ctx, 0)
+	assert.NoError(t, q.PushRequest(&Request{UserID: "u", ModelName: "llama", RequestTime: time.Now(), NotifyChan: make(chan struct{})}))
+	assert.NoError(t, q2.PushRequest(&Request{UserID: "u", ModelName: "unrelated", RequestTime: time.Now(), NotifyChan: make(chan struct{})}))
+	time.Sleep(50 * time.Millisecond)
+	base, base2 := checks.Load(), otherChecks.Load()
+	s.Run(ctx)
+	time.Sleep(2 * time.Second)
+	cancel()
+	t.Logf("n=%d pods, ~4 scrape rounds: checks(llama)=%d checks(unrelated)=%d (each llama check scans %d pods)",
+		n, checks.Load()-base, otherChecks.Load()-base2, n)
+}
+
+type altFlakyCounter struct {
+	vals    map[types.NamespacedName]int64
+	decrErr atomic.Bool
+}
+
+func (c *altFlakyCounter) Incr(_ context.Context, n types.NamespacedName) (int64, error) {
+	c.vals[n]++
+	return c.vals[n], nil
+}
+func (c *altFlakyCounter) Decr(_ context.Context, n types.NamespacedName) (int64, error) {
+	if c.decrErr.Load() {
+		return 0, fmt.Errorf("i/o timeout")
+	}
+	c.vals[n]--
+	return c.vals[n], nil
+}
+func (c *altFlakyCounter) Delete(_ context.Context, n types.NamespacedName) error {
+	delete(c.vals, n)
+	return nil
+}
+func (c *altFlakyCounter) BatchGet(_ context.Context, ns []types.NamespacedName) (map[types.NamespacedName]int64, error) {
+	out := map[types.NamespacedName]int64{}
+	for _, n := range ns {
+		if v, ok := c.vals[n]; ok {
+			out[n] = v
+		}
+	}
+	return out, nil
+}
+
+// 8. Incr and Decr pick their backend independently per call: a Redis increment
+// paired with a fallback local decrement leaks +1 in the shared counter.
+func TestAlt_RedisIncrLocalDecrDrift(t *testing.T) {
+	ctr := &altFlakyCounter{vals: map[types.NamespacedName]int64{}}
+	s := New(WithRedisOnFlightCounter(ctr), WithPodRuntimeInspector(&fakePodRuntimeInspector{})).(*store)
+	pn := types.NamespacedName{Namespace: "default", Name: "p"}
+	s.pods.Store(pn, &PodInfo{Pod: altPod("default", "p", "10.0.0.1", nil), engine: "vLLM"})
+	for i := 0; i < 5; i++ {
+		s.IncrPodOnFlightRequests(pn) // streams start while Redis is healthy
+	}
+	ctr.decrErr.Store(true) // Redis blip while the streams finish
+	for i := 0; i < 5; i++ {
+		s.DecrPodOnFlightRequests(pn)
+	}
+	ctr.decrErr.Store(false)
+	t.Logf("after 5 completed requests: redis=%d local=%d", ctr.vals[pn], s.GetPodInfo(pn).GetOnFlightRequestNum())
+	s.lastOnFlightSync.Store(0)
+	s.SyncOnFlightCounts()
+	t.Logf("after SyncOnFlightCounts: local=%d (no request in flight)", s.GetPodInfo(pn).GetOnFlightRequestNum())
+	assert.Equal(t, int64(5), s.GetPodInfo(pn).GetOnFlightRequestNum())
+}
+
+// 9. Same-name pod re-created (new UID) is applied as an in-place update.
+func TestAlt_SameNameNewUIDIsAnUpdate(t *testing.T) {
+	insp := &fakePodRuntimeInspector{
+		metricsFn: func(string, *corev1.Pod, uint32, map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+			return map[string]float64{utils.RequestWaitingNum: 7}, nil
+		},
+		modelsFn: func(string, *corev1.Pod, uint32) ([]string, error) { return []string{"base", "lora-a"}, nil },
+	}
+	s := newStore(insp)
+	var events []EventType
+	var mu = make(chan struct{}, 1)
+	mu <- struct{}{}
+	s.RegisterCallback("Pod", func(d EventData) { <-mu; events = append(events, d.EventType); mu <- struct{}{} })
+	ms := &aiv1alpha1.ModelServer{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ms"},
+		Spec: aiv1alpha1.ModelServerSpec{InferenceEngine: aiv1alpha1.VLLM, WorkloadPort: aiv1alpha1.WorkloadPort{Port: 8000}}}
+	old := altPod("default", "llm-0", "10.0.0.1", nil)
+	old.UID = "uid-1"
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, nil))
+	assert.NoError(t, s.AddOrUpdatePod(old, []*aiv1alpha1.ModelServer{ms}))
+	before := s.GetPodInfo(utils.GetNamespaceName(old))
+	before.IncrOnFlightRequests()
+
+	insp.metricsFn = nil
+	insp.modelsFn = nil
+	nw := altPod("default", "llm-0", "10.0.0.9", nil)
+	nw.UID = "uid-2"
+	assert.NoError(t, s.AddOrUpdatePod(nw, []*aiv1alpha1.ModelServer{ms}))
+	after := s.GetPodInfo(utils.GetNamespaceName(nw))
+	time.Sleep(50 * time.Millisecond)
+	<-mu
+	t.Logf("same PodInfo=%v uid=%s ip=%s waiting=%v models=%v onflight=%d events=%v",
+		before == after, after.GetPod().UID, after.GetPod().Status.PodIP, after.GetRequestWaitingNum(), after.GetModelsList(), after.GetOnFlightRequestNum(), events)
+	mu <- struct{}{}
+	assert.True(t, before == after)
+}
+
+// 10. triggerCallbacks runs each event on its own goroutine: per-key order is lost.
+func TestAlt_CallbackReorder(t *testing.T) {
+	s := newStore(&fakePodRuntimeInspector{})
+	type ev struct {
+		i  int
+		et EventType
+	}
+	var mu = make(chan struct{}, 1)
+	mu <- struct{}{}
+	running := map[string]bool{}
+	var seen []ev
+	s.RegisterCallback("Gateway", func(d EventData) {
+		<-mu
+		key := d.Gateway.String()
+		switch d.EventType {
+		case EventAdd, EventUpdate:
+			if s.GetGateway(key) != nil { // same re-read as cmd/kthena-router/app/router.go:78
+				running[key] = true
+			}
+		case EventDelete:
+			running[key] = false
+		}
+		seen = append(seen, ev{et: d.EventType})
+		mu <- struct{}{}
+	})
+	const n = 2000
+	for i := 0; i < n; i++ {
+		gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: fmt.Sprintf("gw-%d", i)}}
+		_ = s.AddOrUpdateGateway(gw)
+		_ = s.DeleteGateway("default/" + gw.Name) // kubectl replace --force / prune+recreate
+		_ = s.AddOrUpdateGateway(gw)
+	}
+	time.Sleep(500 * time.Millisecond)
+	<-mu
+	stopped := 0
+	for i := 0; i < n; i++ {
+		if !running[fmt.Sprintf("default/gw-%d", i)] {
+			stopped++
+		}
+	}
+	mu <- struct{}{}
+	t.Logf("gateways that exist but whose listeners ended stopped: %d/%d", stopped, n)
+}
+
+// 3b. Selector change A->B: pods matching only A keep the ModelServer in their reverse
+// membership and are never evicted, even after the ModelServer is deleted.
+func TestAlt_SelectorChangeLeavesZombie(t *testing.T) {
+	s := newStore(&fakePodRuntimeInspector{})
+	ms := &aiv1alpha1.ModelServer{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ms"},
+		Spec: aiv1alpha1.ModelServerSpec{InferenceEngine: aiv1alpha1.VLLM, WorkloadPort: aiv1alpha1.WorkloadPort{Port: 8000},
+			WorkloadSelector: &aiv1alpha1.WorkloadSelector{MatchLabels: map[string]string{"app": "v1"}}}}
+	msName := utils.GetNamespaceName(ms)
+	a1 := altPod("default", "a1", "10.0.0.1", map[string]string{"app": "v1"})
+	b1 := altPod("default", "b1", "10.0.0.2", map[string]string{"app": "v2"})
+	a1n, b1n := utils.GetNamespaceName(a1), utils.GetNamespaceName(b1)
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, sets.New(a1n)))
+	assert.NoError(t, s.AddOrUpdatePod(a1, []*aiv1alpha1.ModelServer{ms}))
+	ms2 := ms.DeepCopy()
+	ms2.Spec.WorkloadSelector.MatchLabels = map[string]string{"app": "v2"}
+	assert.NoError(t, s.AddOrUpdateModelServer(ms2, sets.New(b1n)))
+	assert.NoError(t, s.AddOrUpdatePod(b1, []*aiv1alpha1.ModelServer{ms2}))
+	assert.NoError(t, s.DeleteModelServer(msName))
+	t.Logf("after DeleteModelServer: a1 present=%v (modelServers=%v) b1 present=%v",
+		s.GetPodInfo(a1n) != nil, s.GetPodInfo(a1n).GetModelServersList(), s.GetPodInfo(b1n) != nil)
+	assert.NotNil(t, s.GetPodInfo(a1n))
+}

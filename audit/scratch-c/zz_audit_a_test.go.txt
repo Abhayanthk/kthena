@@ -1,0 +1,302 @@
+package datastore
+
+import (
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"context"
+	"math"
+	"net/http"
+	"net/url"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/redis/go-redis/v9"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+)
+
+// A: session-boost capacity gate keys pods by the client-facing model name.
+func TestZZA_SessionBoostModelNameMismatch(t *testing.T) {
+	s := &store{fairnessQueueConfig: newSessionBoostStoreConfig()}
+	for i, name := range []string{"p0", "p1", "p2", "p3"} {
+		_ = i
+		s.pods.Store(types.NamespacedName{Namespace: "default", Name: name}, &PodInfo{
+			Pod:               &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name}},
+			engine:            "vLLM",
+			models:            sets.New[string]("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"),
+			RequestWaitingNum: 5, // every pod busy
+		})
+	}
+	// Queue key = request model name = ModelRoute.spec.modelName
+	checker := s.makeBackendWaitingChecker("deepseek-simple")
+	counter := s.makeBackendPodCounter("deepseek-simple")
+	t.Logf("checker(all pods busy)=%v podCounter=%d", checker(), counter())
+	// Same pods, keyed by served name: correct answers
+	t.Logf("checker(served name)=%v podCounter(served name)=%d",
+		s.makeBackendWaitingChecker("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")(),
+		s.makeBackendPodCounter("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")())
+
+	// End-to-end through Enqueue: all pods busy, yet requests are admitted.
+	var admitted int
+	reqs := make([]*Request, 0, 40)
+	for i := 0; i < 40; i++ {
+		r := &Request{UserID: "u", ModelName: "deepseek-simple", RequestTime: time.Now(), NotifyChan: make(chan struct{})}
+		reqs = append(reqs, r)
+		if err := s.Enqueue(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	for _, r := range reqs {
+		if isClosed(r.NotifyChan) {
+			admitted++
+		}
+	}
+	t.Logf("admitted %d of 40 while every one of 4 pods reports waiting=5 (doc: limit=16*4=64 and backend check must hold)", admitted)
+	if v, ok := s.requestWaitingQueue.Load("deepseek-simple"); ok {
+		v.(*RequestPriorityQueue).Close()
+	}
+}
+
+// B: priority refresh / rebuild overwrites the anonymous MaxFloat64 sentinel with 0.
+func TestZZA_AnonymousSentinelOverwrittenByRebuild(t *testing.T) {
+	tracker := NewInMemorySlidingWindowTokenTracker()
+	_ = tracker.UpdateTokenCount("alice", "m", 200, 0) // alice now 200 tokens
+	_ = tracker.UpdateTokenCount("bob", "m", 150, 0)   // bob 150
+	cfg := DefaultFairnessQueueConfig()
+	cfg.MaxPriorityRefreshRetries = 1
+	q := NewRequestPriorityQueueWithConfig(nil, cfg, tracker, nil)
+	defer q.Close()
+	now := time.Now()
+	// alice's priority was computed when she had 50 tokens (stale), bob's is current,
+	// anonymous request gets the router's MaxFloat64 sentinel.
+	_ = q.PushRequest(&Request{UserID: "alice", ModelName: "m", Priority: 50, RequestTime: now})
+	_ = q.PushRequest(&Request{UserID: "bob", ModelName: "m", Priority: 150, RequestTime: now.Add(time.Millisecond)})
+	_ = q.PushRequest(&Request{UserID: "", ModelName: "m", Priority: math.MaxFloat64, RequestTime: now.Add(2 * time.Millisecond)})
+	_ = q.PushRequest(&Request{UserID: "", ModelName: "m", Priority: math.MaxFloat64, RequestTime: now.Add(3 * time.Millisecond)})
+	var order []string
+	for i := 0; i < 4; i++ {
+		r, err := q.popWhenAvailable(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		u := r.UserID
+		if u == "" {
+			u = "<anonymous>"
+		}
+		order = append(order, u)
+	}
+	t.Logf("dequeue order: %v (policy: authenticated first, anonymous last)", order)
+}
+
+// C: Redis Decr failure leaks a permanent global in-flight count.
+func TestZZA_RedisDecrFailureLeaksGlobalCount(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	s := &store{onFlightCounter: NewRedisOnFlightCounter(client)}
+	pod := types.NamespacedName{Namespace: "default", Name: "p"}
+	pi := &PodInfo{Pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p"}}}
+	s.pods.Store(pod, pi)
+
+	s.IncrPodOnFlightRequests(pod) // redis=1, local=1
+	mr.SetError("LOADING simulated outage")
+	s.DecrPodOnFlightRequests(pod) // redis fails -> local only
+	mr.SetError("")
+	t.Logf("after request finished: local=%d", pi.GetOnFlightRequestNum())
+	time.Sleep(60 * time.Millisecond)
+	s.SyncOnFlightCounts()
+	t.Logf("after SyncOnFlightCounts with no request in flight: local=%d redis=%s", pi.GetOnFlightRequestNum(), mr.HGet(redisOnFlightHashKey, "default/p"))
+}
+
+// D: AddOrUpdateModelServer drops pods from ms.pods but not ms from PodInfo; DeleteModelServer then cannot evict them.
+func TestZZA_SelectorChangeLeaksPodInfo(t *testing.T) {
+	s := &store{
+		fairnessQueueConfig: newSessionBoostStoreConfig(),
+		podRuntimeInspector: &fakePodRuntimeInspector{
+			metricsFn: func(string, *corev1.Pod, uint32, map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+				return nil, nil
+			},
+			modelsFn: func(string, *corev1.Pod, uint32) ([]string, error) { return []string{"llama"}, nil },
+		},
+		callbacks: map[string][]CallbackFunc{},
+	}
+	msV1 := &aiv1alpha1.ModelServer{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ms"},
+		Spec: aiv1alpha1.ModelServerSpec{InferenceEngine: aiv1alpha1.VLLM,
+			WorkloadSelector: &aiv1alpha1.WorkloadSelector{MatchLabels: map[string]string{"app": "v1"}}},
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "old-0", Labels: map[string]string{"app": "v1"}},
+		Status: corev1.PodStatus{PodIP: "10.0.0.1"}}
+	podName := types.NamespacedName{Namespace: "default", Name: "old-0"}
+	msName := types.NamespacedName{Namespace: "default", Name: "ms"}
+
+	_ = s.AddOrUpdateModelServer(msV1, sets.New(podName))
+	_ = s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{msV1})
+
+	msV2 := msV1.DeepCopy()
+	msV2.Spec.WorkloadSelector.MatchLabels = map[string]string{"app": "v2"}
+	_ = s.AddOrUpdateModelServer(msV2, sets.New[types.NamespacedName]()) // controller: no ready v2 pods yet
+
+	pods, _ := s.GetPodsByModelServer(msName)
+	t.Logf("after selector switch: ms pods=%d, old pod still in store=%v, its modelServers=%v", len(pods), s.GetPodInfo(podName) != nil, s.GetPodInfo(podName).GetModelServersList())
+
+	_ = s.DeleteModelServer(msName)
+	pi := s.GetPodInfo(podName)
+	t.Logf("after DeleteModelServer: old pod still in store=%v modelServers=%v counted by session-boost podCounter(llama)=%d",
+		pi != nil, pi.GetModelServersList(), s.makeBackendPodCounter("llama")())
+}
+
+// E: Enqueue after DeleteModelRoute recreates a queue nobody will close.
+func TestZZA_EnqueueAfterRouteDeleteLeaksQueue(t *testing.T) {
+	s := &store{
+		routeInfo:           make(map[string]*modelRouteInfo),
+		routes:              make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:          make(map[string][]*aiv1alpha1.ModelRoute),
+		gatewayModelRoutes:  make(map[string]sets.Set[string]),
+		callbacks:           map[string][]CallbackFunc{},
+		fairnessQueueConfig: DefaultFairnessQueueConfig(),
+		tokenTracker:        NewInMemorySlidingWindowTokenTracker(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.rootCtx = ctx
+	mr := &aiv1alpha1.ModelRoute{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "r"},
+		Spec: aiv1alpha1.ModelRouteSpec{ModelName: "x", Rules: []*aiv1alpha1.Rule{{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms"}}}}}}
+	_ = s.AddOrUpdateModelRoute(mr)
+	hasModel := s.HasModel("x") // handler computes this early (router.go:314)
+	_ = s.DeleteModelRoute("default/r")
+	// request continues past tokenization / rate limiting and enqueues
+	_ = s.Enqueue(&Request{UserID: "u", ModelName: "x", RequestTime: time.Now(), NotifyChan: make(chan struct{})})
+	_, queued := s.requestWaitingQueue.Load("x")
+	t.Logf("handler saw HasModel=%v; after delete+enqueue: queue for x present=%v, HasModel now=%v (no future DeleteModelRoute will close it)", hasModel, queued, s.HasModel("x"))
+}
+
+// F: DeleteModelRoute closes a queue whose name is still served through the other index.
+func TestZZA_DeleteRouteClosesLiveLoraQueue(t *testing.T) {
+	s := &store{
+		routeInfo:           make(map[string]*modelRouteInfo),
+		routes:              make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:          make(map[string][]*aiv1alpha1.ModelRoute),
+		gatewayModelRoutes:  make(map[string]sets.Set[string]),
+		callbacks:           map[string][]CallbackFunc{},
+		fairnessQueueConfig: DefaultFairnessQueueConfig(),
+		tokenTracker:        NewInMemorySlidingWindowTokenTracker(),
+	}
+	s.fairnessQueueConfig.MaxConcurrent = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.rootCtx = ctx
+	rule := []*aiv1alpha1.Rule{{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms"}}}}
+	a := &aiv1alpha1.ModelRoute{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "a"}, Spec: aiv1alpha1.ModelRouteSpec{ModelName: "foo", Rules: rule}}
+	b := &aiv1alpha1.ModelRoute{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "b"}, Spec: aiv1alpha1.ModelRouteSpec{ModelName: "base", LoraAdapters: []string{"foo"}, Rules: rule}}
+	_ = s.AddOrUpdateModelRoute(a)
+	_ = s.AddOrUpdateModelRoute(b)
+	first := &Request{UserID: "u", ModelName: "foo", RequestTime: time.Now(), NotifyChan: make(chan struct{})}
+	_ = s.Enqueue(first)
+	time.Sleep(50 * time.Millisecond)
+	cancelled := make(chan struct{})
+	waiting := &Request{UserID: "u", ModelName: "foo", RequestTime: time.Now(), NotifyChan: make(chan struct{}), Cancel: func() { close(cancelled) }}
+	_ = s.Enqueue(waiting)
+	_ = s.DeleteModelRoute("default/a")
+	select {
+	case <-cancelled:
+		t.Logf("HasModel(foo)=%v after deleting a, but the waiting request was cancelled by queue Close", s.HasModel("foo"))
+	case <-time.After(200 * time.Millisecond):
+		t.Logf("waiting request not cancelled")
+	}
+}
+
+// RV: same-second routes ordered by ResourceVersion string; flips on update.
+func TestZZA_RouteOrderResourceVersion(t *testing.T) {
+	ts := metav1.NewTime(time.Unix(1700000000, 0))
+	mk := func(name, rv, server string) *aiv1alpha1.ModelRoute {
+		return &aiv1alpha1.ModelRoute{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name, CreationTimestamp: ts, ResourceVersion: rv},
+			Spec: aiv1alpha1.ModelRouteSpec{ModelName: "llama", Rules: []*aiv1alpha1.Rule{{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: server}}}}}}
+	}
+	newStore := func() *store {
+		return &store{routeInfo: map[string]*modelRouteInfo{}, routes: map[string][]*aiv1alpha1.ModelRoute{}, loraRoutes: map[string][]*aiv1alpha1.ModelRoute{},
+			gatewayModelRoutes: map[string]sets.Set[string]{}, callbacks: map[string][]CallbackFunc{}}
+	}
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}, Header: http.Header{}}
+
+	s := newStore()
+	_ = s.AddOrUpdateModelRoute(mk("first", "9", "first-server"))
+	_ = s.AddOrUpdateModelRoute(mk("second", "10", "second-server"))
+	tgt, _, _, _, _ := s.MatchModelTarget("llama", req, "")
+	t.Logf("created first(rv=9) then second(rv=10) in same second -> winner=%s", tgt.Name.Name)
+
+	s = newStore()
+	_ = s.AddOrUpdateModelRoute(mk("first", "100", "first-server"))
+	_ = s.AddOrUpdateModelRoute(mk("second", "101", "second-server"))
+	tgt, _, _, _, _ = s.MatchModelTarget("llama", req, "")
+	t.Logf("before update -> winner=%s", tgt.Name.Name)
+	_ = s.AddOrUpdateModelRoute(mk("first", "102", "first-server")) // edit of first bumps its RV
+	tgt, _, _, _, _ = s.MatchModelTarget("llama", req, "")
+	t.Logf("after editing first (rv 100->102) -> winner=%s", tgt.Name.Name)
+}
+
+// G: triggerCallbacks spawns one goroutine per event, so back-to-back events for one
+// model can be applied out of order (GOMAXPROCS=1, e.g. a router pod with a 1-CPU limit).
+func TestZZA_CallbackReorder(t *testing.T) {
+	prev := runtime.GOMAXPROCS(8)
+	defer runtime.GOMAXPROCS(prev)
+	reversed := 0
+	const trials = 200
+	for i := 0; i < trials; i++ {
+		s := &store{routeInfo: map[string]*modelRouteInfo{}, routes: map[string][]*aiv1alpha1.ModelRoute{}, loraRoutes: map[string][]*aiv1alpha1.ModelRoute{},
+			gatewayModelRoutes: map[string]sets.Set[string]{}, callbacks: map[string][]CallbackFunc{}}
+		var mu sync.Mutex
+		var seen []EventType
+		done := make(chan struct{}, 2)
+		s.RegisterCallback("ModelRoute", func(d EventData) {
+			mu.Lock()
+			seen = append(seen, d.EventType)
+			mu.Unlock()
+			done <- struct{}{}
+		})
+		mr := &aiv1alpha1.ModelRoute{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "r"},
+			Spec: aiv1alpha1.ModelRouteSpec{ModelName: "x", Rules: []*aiv1alpha1.Rule{{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms"}}}}}}
+		// ModelRoute worker: delete then immediately re-create (key re-queued while processing)
+		_ = s.DeleteModelRoute("default/r")
+		_ = s.AddOrUpdateModelRoute(mr)
+		<-done
+		<-done
+		if seen[len(seen)-1] == EventDelete {
+			reversed++
+		}
+	}
+	t.Logf("delete->add issued; subscriber saw delete LAST in %d/%d trials (route exists, limiter removed)", reversed, trials)
+}
+
+// Scrape cadence: one slow pod gates the next scrape cycle of every other pod.
+func TestZZA_SlowPodThrottlesAllScrapes(t *testing.T) {
+	var fastScrapes atomic.Int64
+	inspector := &fakePodRuntimeInspector{
+		metricsFn: func(_ string, p *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+			if p.Name == "slow" {
+				time.Sleep(2 * time.Second) // e.g. unreachable pod hitting the 5s client timeout
+				return nil, nil
+			}
+			fastScrapes.Add(1)
+			return map[string]float64{}, nil
+		},
+		modelsFn: func(string, *corev1.Pod, uint32) ([]string, error) { return nil, nil },
+	}
+	s := &store{podRuntimeInspector: inspector, metricsScrapeInterval: 100 * time.Millisecond, initialSynced: &atomic.Bool{}}
+	for _, n := range []string{"fast", "slow"} {
+		s.pods.Store(types.NamespacedName{Namespace: "d", Name: n}, &PodInfo{engine: "vLLM",
+			Pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "d", Name: n}, Status: corev1.PodStatus{PodIP: "10.0.0.1"}}})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.Run(ctx)
+	time.Sleep(4100 * time.Millisecond)
+	cancel()
+	t.Logf("fast pod scraped %d times in 4.1s with METRICS_SCRAPE_INTERVAL=100ms (expected ~41)", fastScrapes.Load())
+}

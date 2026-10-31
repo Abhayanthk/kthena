@@ -1,0 +1,571 @@
+package datastore
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	dto "github.com/prometheus/client_model/go"
+	"github.com/redis/go-redis/v9"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
+
+	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
+)
+
+// startBlackHole accepts TCP connections, reads everything, and never replies.
+func startBlackHole(t *testing.T) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			go func() { _, _ = io.Copy(io.Discard, c) }()
+		}
+	}()
+	return ln.Addr().String(), func() {
+		_ = ln.Close()
+		mu.Lock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		mu.Unlock()
+	}
+}
+
+func effPod(name, ip string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name, Labels: map[string]string{"app": "x"}},
+		Status: corev1.PodStatus{
+			PodIP: ip,
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+}
+
+// A: AddOrUpdatePod (new-pod path) with the REAL backend inspector against a
+// Ready pod whose metrics port accepts but never answers.
+func TestEff_AddOrUpdatePodBlocksControllerWorker(t *testing.T) {
+	addr, stop := startBlackHole(t)
+	defer stop()
+	host, portStr, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portStr)
+
+	s := New().(*store)
+	ms := &aiv1alpha1.ModelServer{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ms"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			InferenceEngine: "vLLM",
+			WorkloadPort:    aiv1alpha1.WorkloadPort{Port: int32(port)},
+		},
+	}
+	_ = s.AddOrUpdateModelServer(ms, nil)
+
+	start := time.Now()
+	_ = s.AddOrUpdatePod(effPod("hang-0", host), []*aiv1alpha1.ModelServer{ms})
+	el := time.Since(start)
+	t.Logf("AddOrUpdatePod(new pod, hanging metrics port) took %v", el)
+
+	// Contrast: a Pod-delete for some other pod queued behind it would only run now.
+	start = time.Now()
+	_ = s.DeletePod(types.NamespacedName{Namespace: "default", Name: "other"})
+	t.Logf("DeletePod itself takes %v (it waited %v behind the add on the single worker)", time.Since(start), el)
+}
+
+type slowInspector struct {
+	slowPod  string
+	delay    time.Duration
+	scrapes  sync.Map // pod name -> *atomic.Int64
+	waiting  float64
+	models   []string
+	modelsFn func() []string
+}
+
+func (f *slowInspector) counter(name string) *atomic.Int64 {
+	v, _ := f.scrapes.LoadOrStore(name, &atomic.Int64{})
+	return v.(*atomic.Int64)
+}
+
+func (f *slowInspector) GetPodMetrics(engine string, pod *corev1.Pod, port uint32, prev map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+	f.counter(pod.Name).Add(1)
+	if pod.Name == f.slowPod {
+		time.Sleep(f.delay)
+		return nil, nil
+	}
+	return map[string]float64{utils.RequestWaitingNum: f.waiting}, nil
+}
+
+func (f *slowInspector) GetPodModels(engine string, pod *corev1.Pod, port uint32) ([]string, error) {
+	if pod.Name == f.slowPod {
+		time.Sleep(f.delay)
+		return nil, io.ErrUnexpectedEOF
+	}
+	return f.models, nil
+}
+
+// B: one slow pod stretches every pod's scrape period (barrier per cycle).
+func TestEff_ScrapeBarrier(t *testing.T) {
+	insp := &slowInspector{slowPod: "slow", delay: 2500 * time.Millisecond, models: []string{"m"}}
+	s := New(WithPodRuntimeInspector(insp)).(*store)
+	for _, n := range []string{"slow", "healthy-a", "healthy-b"} {
+		pi := &PodInfo{Pod: effPod(n, "10.0.0.1"), engine: "vLLM", models: sets.New[string]("m"), modelServer: sets.New[types.NamespacedName]()}
+		s.pods.Store(types.NamespacedName{Namespace: "default", Name: n}, pi)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	s.Run(ctx)
+	for !s.HasSynced() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Logf("HasSynced became true after %v (scrape interval %v)", time.Since(start), s.metricsScrapeInterval)
+	time.Sleep(10*time.Second - time.Since(start))
+	t.Logf("in 10s: healthy-a scraped %d times, slow scraped %d times (expected ~10 at 1s interval)",
+		insp.counter("healthy-a").Load(), insp.counter("slow").Load())
+}
+
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *syncBuf) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+func (w *syncBuf) count(sub string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return strings.Count(w.b.String(), sub)
+}
+
+// C+D: session boost under sustained backend backpressure (every pod waiting>0,
+// router inflight below InflightPerPod*pods): count checker/podCounter scans and
+// un-gated Info log lines for (1) one scrape cycle and (2) a burst of arrivals.
+func TestEff_SessionBoostRecheckAndLogFlood(t *testing.T) {
+	const P = 200
+	buf := &syncBuf{}
+	klog.LogToStderr(false)
+	klog.SetOutput(buf)
+	defer func() { klog.LogToStderr(true) }()
+
+	insp := &slowInspector{waiting: 3, models: []string{"m"}}
+	s := New(WithPodRuntimeInspector(insp)).(*store)
+	s.fairnessQueueConfig.SessionBoostEnabled = true
+	for i := 0; i < P; i++ {
+		n := "p-" + strconv.Itoa(i)
+		pi := &PodInfo{Pod: effPod(n, "10.0.0.1"), engine: "vLLM", models: sets.New[string]("m"), modelServer: sets.New[types.NamespacedName]()}
+		pi.RequestWaitingNum = 3
+		s.pods.Store(types.NamespacedName{Namespace: "default", Name: n}, pi)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.rootCtx = ctx
+
+	var checks, counts atomic.Int64
+	base := s.makeBackendWaitingChecker("m")
+	baseCounter := s.makeBackendPodCounter("m")
+	q := NewRequestPriorityQueueWithConfig(nil, s.fairnessQueueConfig, s.tokenTracker, func() bool { checks.Add(1); return base() })
+	q.podCounter = func() int { counts.Add(1); return baseCounter() }
+	s.requestWaitingQueue.Store("m", q)
+	go q.Run(ctx, 0)
+
+	// one held request
+	_ = s.Enqueue(&Request{ModelName: "m", RequestTime: time.Now(), NotifyChan: make(chan struct{}), CancelCh: ctx.Done()})
+	time.Sleep(200 * time.Millisecond)
+	c0, k0, l0 := checks.Load(), counts.Load(), buf.count("[BackendWaitingChecker]")
+
+	// (1) one scrape cycle
+	s.Run(ctx)
+	time.Sleep(900 * time.Millisecond)
+	c1, k1, l1 := checks.Load(), counts.Load(), buf.count("[BackendWaitingChecker]")
+	t.Logf("one scrape cycle over %d pods: backendChecker runs=%d podCounter runs=%d (each O(%d) RLock scan), Info log lines=%d",
+		P, c1-c0, k1-k0, P, l1-l0)
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+
+	// (2) burst of 2000 arrivals while held (separate store, no scraping)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	s.rootCtx = ctx2
+	q2 := NewRequestPriorityQueueWithConfig(nil, s.fairnessQueueConfig, s.tokenTracker, func() bool { checks.Add(1); return base() })
+	q2.podCounter = baseCounter
+	s.requestWaitingQueue.Store("m", q2)
+	go q2.Run(ctx2, 0)
+	c2, l2 := checks.Load(), buf.count("[BackendWaitingChecker]")
+	start := time.Now()
+	for i := 0; i < 2000; i++ {
+		_ = s.Enqueue(&Request{ModelName: "m", RequestTime: time.Now(), NotifyChan: make(chan struct{}), CancelCh: ctx2.Done()})
+		time.Sleep(500 * time.Microsecond) // ~2000 req/s offered
+	}
+	time.Sleep(100 * time.Millisecond)
+	el := time.Since(start)
+	t.Logf("2000 arrivals in %v while held: backendChecker runs=%d, Info log lines=%d (%.0f lines/s), bytes logged=%d",
+		el, checks.Load()-c2, buf.count("[BackendWaitingChecker]")-l2, float64(buf.count("[BackendWaitingChecker]")-l2)/el.Seconds(), buf.b.Len())
+}
+
+// E: Redis on-flight counter with an unresponsive Redis: the 100ms ctx does
+// not bound the call because go-redis ignores ctx deadlines for socket I/O
+// unless ContextTimeoutEnabled is set (utils.TryGetRedisClient does not set it).
+func TestEff_RedisCtxTimeoutIgnored(t *testing.T) {
+	addr, stop := startBlackHole(t)
+	defer stop()
+	client := redis.NewClient(&redis.Options{Addr: addr, Password: "", DB: 0}) // same options as utils.TryGetRedisClient
+	defer client.Close()
+	s := New(WithRedisOnFlightCounter(NewRedisOnFlightCounter(client))).(*store)
+	pn := types.NamespacedName{Namespace: "default", Name: "p"}
+	s.pods.Store(pn, &PodInfo{Pod: effPod("p", "10.0.0.1"), models: sets.New[string](), modelServer: sets.New[types.NamespacedName]()})
+
+	start := time.Now()
+	s.IncrPodOnFlightRequests(pn)
+	t.Logf("IncrPodOnFlightRequests with 100ms ctx took %v", time.Since(start))
+	start = time.Now()
+	s.DecrPodOnFlightRequests(pn)
+	t.Logf("DecrPodOnFlightRequests with 100ms ctx took %v", time.Since(start))
+	start = time.Now()
+	s.SyncOnFlightCounts()
+	t.Logf("SyncOnFlightCounts with 100ms ctx took %v", time.Since(start))
+	start = time.Now()
+	_ = s.DeletePod(pn)
+	t.Logf("DeletePod (controller worker) with 100ms ctx took %v", time.Since(start))
+}
+
+// F: callback goroutines reorder events for the same object.
+func TestEff_CallbackReordering(t *testing.T) {
+	const trials = 2000
+	staleUpdate, lostLimiter := 0, 0
+	for trial := 0; trial < trials; trial++ {
+		s := New().(*store)
+		var mu sync.Mutex
+		limiters := map[string]uint32{}
+		var wg sync.WaitGroup
+		s.RegisterCallback("ModelRoute", func(d EventData) {
+			defer wg.Done()
+			mu.Lock()
+			defer mu.Unlock()
+			switch d.EventType {
+			case EventAdd, EventUpdate:
+				if d.ModelRoute == nil || d.ModelRoute.Spec.RateLimit == nil {
+					return
+				}
+				limiters[d.ModelName] = *d.ModelRoute.Spec.RateLimit.InputTokensPerUnit
+			case EventDelete:
+				delete(limiters, d.ModelName)
+			}
+		})
+		mk := func(name string, v uint32) *aiv1alpha1.ModelRoute {
+			vv := v
+			return &aiv1alpha1.ModelRoute{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
+				Spec: aiv1alpha1.ModelRouteSpec{
+					ModelName: "m",
+					RateLimit: &aiv1alpha1.RateLimit{InputTokensPerUnit: &vv, Unit: aiv1alpha1.Second},
+					Rules:     []*aiv1alpha1.Rule{{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms"}}}},
+				},
+			}
+		}
+		// Scenario 1: two successive updates of the same route (10 -> 100).
+		wg.Add(2)
+		_ = s.AddOrUpdateModelRoute(mk("r", 10))
+		_ = s.AddOrUpdateModelRoute(mk("r", 100))
+		wg.Wait()
+		mu.Lock()
+		if limiters["m"] != 100 {
+			staleUpdate++
+		}
+		mu.Unlock()
+		// Scenario 2: route replaced (delete old, create new for same model with a limit).
+		wg.Add(2)
+		_ = s.DeleteModelRoute("default/r")
+		_ = s.AddOrUpdateModelRoute(mk("r2", 50))
+		wg.Wait()
+		mu.Lock()
+		if _, ok := limiters["m"]; !ok {
+			lostLimiter++
+		}
+		mu.Unlock()
+	}
+	t.Logf("of %d trials: stale limiter after update 10->100: %d; limiter lost after delete r + create r2: %d", trials, staleUpdate, lostLimiter)
+}
+
+func TestEff_RecheckCostLargeFleet(t *testing.T) {
+	for _, P := range []int{200, 1000} {
+		buf := &syncBuf{}
+		klog.LogToStderr(false)
+		klog.SetOutput(buf)
+
+		insp := &slowInspector{waiting: 3, models: []string{"m"}}
+		s := New(WithPodRuntimeInspector(insp)).(*store)
+		s.fairnessQueueConfig.SessionBoostEnabled = true
+		for i := 0; i < P; i++ {
+			n := "p-" + strconv.Itoa(i)
+			pi := &PodInfo{Pod: effPod(n, "10.0.0.1"), engine: "vLLM", models: sets.New[string]("m"), modelServer: sets.New[types.NamespacedName]()}
+			pi.RequestWaitingNum = 3
+			s.pods.Store(types.NamespacedName{Namespace: "default", Name: n}, pi)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		s.rootCtx = ctx
+		var checks atomic.Int64
+		var spent atomic.Int64
+		base := s.makeBackendWaitingChecker("m")
+		baseCounter := s.makeBackendPodCounter("m")
+		q := NewRequestPriorityQueueWithConfig(nil, s.fairnessQueueConfig, s.tokenTracker, func() bool {
+			st := time.Now()
+			r := base()
+			spent.Add(int64(time.Since(st)))
+			checks.Add(1)
+			return r
+		})
+		q.podCounter = func() int { st := time.Now(); r := baseCounter(); spent.Add(int64(time.Since(st))); return r }
+		s.requestWaitingQueue.Store("m", q)
+		go q.Run(ctx, 0)
+		_ = s.Enqueue(&Request{ModelName: "m", RequestTime: time.Now(), NotifyChan: make(chan struct{}), CancelCh: ctx.Done()})
+		time.Sleep(200 * time.Millisecond)
+		c0, sp0, l0 := checks.Load(), spent.Load(), buf.count("[BackendWaitingChecker]")
+		s.Run(ctx)
+		time.Sleep(2900 * time.Millisecond) // ~3 cycles
+		t.Logf("P=%d, ~3 scrape cycles: checker runs=%d, time in checker+podCounter=%v, Info lines=%d",
+			P, checks.Load()-c0, time.Duration(spent.Load()-sp0), buf.count("[BackendWaitingChecker]")-l0)
+		cancel()
+		time.Sleep(100 * time.Millisecond)
+	}
+	klog.LogToStderr(true)
+}
+
+type jitterInspector struct{}
+
+func (jitterInspector) GetPodMetrics(engine string, pod *corev1.Pod, port uint32, prev map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+	n, _ := strconv.Atoi(strings.TrimPrefix(pod.Name, "p-"))
+	time.Sleep(time.Duration(n%200) * time.Millisecond) // 0-199ms spread
+	return map[string]float64{utils.RequestWaitingNum: 3}, nil
+}
+func (jitterInspector) GetPodModels(engine string, pod *corev1.Pod, port uint32) ([]string, error) {
+	n, _ := strconv.Atoi(strings.TrimPrefix(pod.Name, "p-"))
+	time.Sleep(time.Duration((n*7)%50) * time.Millisecond)
+	return []string{"m"}, nil
+}
+
+func TestEff_RecheckCostJitter(t *testing.T) {
+	for _, P := range []int{100, 1000} {
+		buf := &syncBuf{}
+		klog.LogToStderr(false)
+		klog.SetOutput(buf)
+		s := New(WithPodRuntimeInspector(jitterInspector{})).(*store)
+		s.fairnessQueueConfig.SessionBoostEnabled = true
+		for i := 0; i < P; i++ {
+			n := "p-" + strconv.Itoa(i)
+			pi := &PodInfo{Pod: effPod(n, "10.0.0.1"), engine: "vLLM", models: sets.New[string]("m"), modelServer: sets.New[types.NamespacedName]()}
+			pi.RequestWaitingNum = 3
+			s.pods.Store(types.NamespacedName{Namespace: "default", Name: n}, pi)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		s.rootCtx = ctx
+		var checks, spent atomic.Int64
+		base := s.makeBackendWaitingChecker("m")
+		baseCounter := s.makeBackendPodCounter("m")
+		q := NewRequestPriorityQueueWithConfig(nil, s.fairnessQueueConfig, s.tokenTracker, func() bool {
+			st := time.Now()
+			r := base()
+			spent.Add(int64(time.Since(st)))
+			checks.Add(1)
+			return r
+		})
+		q.podCounter = func() int { st := time.Now(); r := baseCounter(); spent.Add(int64(time.Since(st))); return r }
+		s.requestWaitingQueue.Store("m", q)
+		go q.Run(ctx, 0)
+		_ = s.Enqueue(&Request{ModelName: "m", RequestTime: time.Now(), NotifyChan: make(chan struct{}), CancelCh: ctx.Done()})
+		time.Sleep(200 * time.Millisecond)
+		c0, sp0, l0 := checks.Load(), spent.Load(), buf.count("[BackendWaitingChecker]")
+		start := time.Now()
+		s.Run(ctx)
+		time.Sleep(3 * time.Second)
+		el := time.Since(start)
+		runs := checks.Load() - c0
+		t.Logf("P=%d over %v (~3 cycles): checker runs=%d (%.0f/s), CPU in checker+podCounter=%v (%.1f%% of one core), Info lines=%d (%.0f/s)",
+			P, el.Round(time.Millisecond), runs, float64(runs)/el.Seconds(), time.Duration(spent.Load()-sp0),
+			100*float64(spent.Load()-sp0)/float64(el), buf.count("[BackendWaitingChecker]")-l0, float64(buf.count("[BackendWaitingChecker]")-l0)/el.Seconds())
+		cancel()
+		time.Sleep(300 * time.Millisecond)
+	}
+	klog.LogToStderr(true)
+}
+
+func TestEff_DrainScanUnderLock(t *testing.T) {
+	klog.LogToStderr(false)
+	klog.SetOutput(io.Discard)
+	defer klog.LogToStderr(true)
+	for _, n := range []int{3000, 30000} {
+		cfg := DefaultFairnessQueueConfig()
+		cfg.SessionBoostEnabled = true
+		cfg.InflightPerPod = 1
+		q := NewRequestPriorityQueueWithConfig(nil, cfg, nil, func() bool { return false }) // backends busy
+		q.podCounter = func() int { return 1 }
+		ctx, cancel := context.WithCancel(context.Background())
+		for i := 0; i < n; i++ {
+			_ = q.PushRequest(&Request{ModelName: "m", SessionID: "s" + strconv.Itoa(i), RequestTime: time.Now(), NotifyChan: make(chan struct{}), CancelCh: ctx.Done()})
+		}
+		// single scan cost
+		q.mu.Lock()
+		st := time.Now()
+		q.drainCancelledLocked()
+		one := time.Since(st)
+		q.mu.Unlock()
+
+		go q.Run(ctx, 0)
+		// offered arrivals ~2000/s for 2s, measure PushRequest latency
+		var lat []time.Duration
+		stop := time.Now().Add(2 * time.Second)
+		for time.Now().Before(stop) {
+			st := time.Now()
+			_ = q.PushRequest(&Request{ModelName: "m", RequestTime: time.Now(), NotifyChan: make(chan struct{}), CancelCh: ctx.Done()})
+			lat = append(lat, time.Since(st))
+			time.Sleep(500 * time.Microsecond)
+		}
+		var max, sum time.Duration
+		for _, l := range lat {
+			sum += l
+			if l > max {
+				max = l
+			}
+		}
+		t.Logf("heap=%d: one drainCancelledLocked scan (pq.mu held) = %v; during %d arrivals: PushRequest avg=%v max=%v",
+			n, one, len(lat), sum/time.Duration(len(lat)), max)
+		cancel()
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestEff_CallbackReorderingWithWork(t *testing.T) {
+	const trials = 2000
+	for _, gap := range []time.Duration{0, 2 * time.Microsecond, 20 * time.Microsecond} {
+		stale, lost := 0, 0
+		for trial := 0; trial < trials; trial++ {
+			s := New().(*store)
+			var mu sync.Mutex
+			limiters := map[string]uint32{}
+			var wg sync.WaitGroup
+			s.RegisterCallback("ModelRoute", func(d EventData) {
+				defer wg.Done()
+				mu.Lock()
+				defer mu.Unlock()
+				switch d.EventType {
+				case EventAdd, EventUpdate:
+					if d.ModelRoute != nil && d.ModelRoute.Spec.RateLimit != nil {
+						limiters[d.ModelName] = *d.ModelRoute.Spec.RateLimit.InputTokensPerUnit
+					}
+				case EventDelete:
+					delete(limiters, d.ModelName)
+				}
+			})
+			mk := func(name string, v uint32) *aiv1alpha1.ModelRoute {
+				vv := v
+				return &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
+					Spec: aiv1alpha1.ModelRouteSpec{ModelName: "m",
+						RateLimit: &aiv1alpha1.RateLimit{InputTokensPerUnit: &vv, Unit: aiv1alpha1.Second},
+						Rules:     []*aiv1alpha1.Rule{{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms"}}}}},
+				}
+			}
+			spin := func() { st := time.Now(); for time.Since(st) < gap { } }
+			wg.Add(2)
+			_ = s.AddOrUpdateModelRoute(mk("r", 10))
+			spin()
+			_ = s.AddOrUpdateModelRoute(mk("r", 100))
+			wg.Wait()
+			if limiters["m"] != 100 {
+				stale++
+			}
+			wg.Add(2)
+			_ = s.DeleteModelRoute("default/r")
+			spin()
+			_ = s.AddOrUpdateModelRoute(mk("r2", 50))
+			wg.Wait()
+			if _, ok := limiters["m"]; !ok {
+				lost++
+			}
+		}
+		t.Logf("gap=%v: stale after update 10->100: %d/%d; limiter lost after delete r + create r2: %d/%d", gap, stale, trials, lost, trials)
+	}
+}
+
+func TestEff_SessionBoostAliasCap(t *testing.T) {
+	klog.LogToStderr(false)
+	klog.SetOutput(io.Discard)
+	defer klog.LogToStderr(true)
+	for _, tc := range []struct {
+		queueModel string
+		waiting    float64
+	}{
+		{"deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", 0}, // request uses served name, pods idle
+		{"deepseek-simple", 0},                           // request uses ModelRoute alias, pods idle
+		{"deepseek-simple", 5},                           // alias, pods all busy
+	} {
+		s := New(WithPodRuntimeInspector(&slowInspector{})).(*store)
+		s.fairnessQueueConfig.SessionBoostEnabled = true
+		for i := 0; i < 10; i++ {
+			n := "p-" + strconv.Itoa(i)
+			pi := &PodInfo{Pod: effPod(n, "10.0.0.1"), engine: "vLLM", models: sets.New[string]("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"), modelServer: sets.New[types.NamespacedName]()}
+			pi.RequestWaitingNum = tc.waiting
+			s.pods.Store(types.NamespacedName{Namespace: "default", Name: n}, pi)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		s.rootCtx = ctx
+		var admitted atomic.Int64
+		for i := 0; i < 200; i++ {
+			r := &Request{ModelName: tc.queueModel, RequestTime: time.Now(), NotifyChan: make(chan struct{}), CancelCh: ctx.Done()}
+			_ = s.Enqueue(r)
+			go func() {
+				select {
+				case <-r.NotifyChan:
+					admitted.Add(1) // never released: models long-running requests
+				case <-ctx.Done():
+				}
+			}()
+		}
+		time.Sleep(300 * time.Millisecond)
+		t.Logf("queue=%q pods(10) waiting=%v InflightPerPod=%d: admitted=%d of 200",
+			tc.queueModel, tc.waiting, s.fairnessQueueConfig.InflightPerPod, admitted.Load())
+		cancel()
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestEff_RouteOrderByResourceVersion(t *testing.T) {
+	ts := metav1.NewTime(time.Unix(1700000000, 0)) // same-second creation (API timestamps have 1s resolution)
+	a := &aiv1alpha1.ModelRoute{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "a-premium", CreationTimestamp: ts, ResourceVersion: "999"}}
+	b := &aiv1alpha1.ModelRoute{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "b-catchall", CreationTimestamp: ts, ResourceVersion: "1000"}}
+	r := []*aiv1alpha1.ModelRoute{a, b}
+	sortModelRoutesInPlace(r)
+	t.Logf("rv a=999 b=1000 -> first=%s", r[0].Name)
+	a2 := a.DeepCopy()
+	a2.ResourceVersion = "1001" // a edited later
+	r = []*aiv1alpha1.ModelRoute{a2, b}
+	sortModelRoutesInPlace(r)
+	t.Logf("rv a=1001 b=1000 -> first=%s", r[0].Name)
+}
